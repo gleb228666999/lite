@@ -1,0 +1,16 @@
+GET /CreateAccount HTTP/2
+Host: www.roblox.com
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:156.0) Gecko/20100101 Firefox/156.0
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7
+Accept-Encoding: gzip, deflate, br, zstd
+Sec-GPC: 1
+Connection: keep-alive
+Cookie: rbx-ip2=1; RBXEventTrackerV2=CreateDate=09/27/2026 12:41:54&rbxid=&rbxuid=&browserid=1790530914902014; GuestData=UserID=-1684084737; RBXPaymentsFlowContext=8773e652-7d39-4482-8be6-d71d5515a62f,; RBXcb=RBXViralAcquisition%3Dtrue%26RBXSource%3Dtrue%26GoogleAnalytics%3Dtrue; __cf_bm=HwPd5SGM126QKp5nZ8YyErDTj822HTi4xdfqRFT9tgM-1790530917.9366767-1.0.1.1-6zk1UEOItpmTCPI_ZUmatNFlfzBFm0408WtvxJjVgNHzK4b1yJy9JtVjV_ViTK4i7nzWzWCIZcYJxVgQkO9C7oUCRUXnhHGBBnqVyIGiP0sRFmjeJirAwi5ojRitudsB; _pxvid=bd12c12c-ba9a-11f1-8c30-67dc6bd2ff75; _px3=35c8563c8252f6aaef8c389f1d729bb8258086526f714998b3a8b674081ca353:qEuD09pVdSXrbS14ep+VEg8DDeBqxREV0iBm+86UWsg3CqLyR2xIsW/oKkq4Ig/6QteiH2sxEWBP/TMncWmZGw==:1000:KfEFeZPLu8rRRHDdJX6GewZGkGOnhf2WJP1n1TYIevH7MoWrQTz6eSqJIWlVKaDbW+R2xSmRyQ89GNBDDcUBuZv4Ss+OsHDhS+jFVG6Y3LoQfH68vEC6B6RN7CAvimn6gCiJMB6ofssVoHUS/RZd6NODBsxClRkW2xeFzB4KlkYEbViZMlKS/1Ew9/DqM4FlbM894o+5z0sxERr5vQzzE4udLM/AfHtWHdTVrrClDGHCaV7lYAxpY+CrGzDg6RQ6SS9s/iEUUfB1OQPZF4srGRypaLM9QFICiCoNLvo6mtbhcIPKFTzpxa42MRR7hb5JfFcHROEwYOLF548v13ZgBwHdkW7EH5+vYDLDjW1Op2q5bO76RuoLka0/CLVXihwJNXLzo7cnL083ow2vEeqX3KqafeLk1V614VfUu3y1kPUCvdBjr5GKa77ub8Sxk+Zql4dbrBuTeGjv1hSM/8Ii07hQ0yXG26B21c43DEVxV4w=; pxcts=e06Jc7OM/v2Z14KXOIHH/9eNI19xuryFTk2olvTZhn0=:fIpidcyxuk8y07hU1X44jYTu/tuXQ9iqlE3gGZyKE2Z0hN4b72mAR6iWNvl4QKSFX7LbU28zhCa0JPN8rgknhPB/chmRuP2JvrmN3G/ZMs2soZI16yEPDnKXRIy8U56eDc4p/H/lbdxLikqPSQLla9/SLkjltUxFjoeD239VRvlqN1pc16VQa060hzzDt-Pv
+Upgrade-Insecure-Requests: 1
+Sec-Fetch-Dest: document
+Sec-Fetch-Mode: navigate
+Sec-Fetch-Site: none
+Sec-Fetch-User: ?1
+Priority: u=0, i
+TE: trailers

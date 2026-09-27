@@ -1,0 +1,15 @@
+GET /js/utilities/bundleVerifier.js?v=91dceb4978eda412b09842312dd6cbaa HTTP/2
+Host: www.roblox.com
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:156.0) Gecko/20100101 Firefox/156.0
+Accept: */*
+Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7
+Accept-Encoding: gzip, deflate, br, zstd
+Sec-GPC: 1
+Connection: keep-alive
+Referer: https://www.roblox.com/CreateAccount
+Cookie: rbx-ip2=1; RBXEventTrackerV2=CreateDate=09/27/2026 12:27:51&rbxid=&rbxuid=&browserid=1790530071238013; GuestData=UserID=-560102412
+Sec-Fetch-Dest: script
+Sec-Fetch-Mode: no-cors
+Sec-Fetch-Site: same-origin
+Priority: u=2
+TE: trailers
