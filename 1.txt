@@ -1,0 +1,1296 @@
+"""
+Roblox Signup v28 — v27 + восстановленные функции валидации ника
+(фикс NameError) + тишина в консоли от asyncio-мусора Playwright.
+
+ФИКС v28: в v27 при сборке потерялись read_username_validation /
+wait_username_validation → NameError на первом нике. Возвращены.
+
+ФИКС v27 (сохранён): полная очистка поля ника — Ctrl+A → Delete →
+проверка el.value == "" + тройной клик запасной + сверка значения
+после ввода (склейка ников невозможна).
+
+Плавность: мышь 8-16 мс/шаг (60-120 Гц), ease-in-out, jitter ×1.8 в
+середине пути, удержание клика 55-120 мс, печать 55-110 мс/знак bursts,
+опечатки 6%, паузы человеческой реакции.
+
+АНТИДЕТЕКТ ЖЕЛЕЗА: экран/окно/ядра CPU — рандом на аккаунт (свежая
+версия Camoufox); WebRTC/WebAuthn — движковый kill; телеметрия — выкл.
+
+Краш браузера: авто-ретрай (новый IP + новое железо). GEOIP = False.
+
+pip install -U "camoufox[geoip]" && camoufox fetch
+Запуск: python main.py [--debug]
+"""
+
+import json
+import logging
+import math
+import random
+import re
+import secrets
+import string
+import sys
+import time
+import warnings
+from datetime import datetime
+from pathlib import Path
+
+from camoufox.sync_api import Camoufox
+
+try:
+    from playwright._impl._errors import TargetClosedError
+except Exception:
+    TargetClosedError = None
+
+# тишина: "Task was destroyed but it is pending!" и
+# "Future exception was never retrieved" — косметика asyncio,
+# реальные краши ловятся в _run_session
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+
+warnings.filterwarnings("ignore", message=".*geoip=True.*")
+warnings.filterwarnings("ignore", message=".*When using a proxy.*")
+
+# ═══════════════════════════════════════════════════════════════════════
+# КОНФИГ — ПЛАВНЫЙ РЕЖИМ
+# ═══════════════════════════════════════════════════════════════════════
+
+# --- аккаунты ---
+ACCOUNTS_TO_CREATE = 1
+ACCOUNT_RETRIES = 2
+ACCOUNT_PAUSE_MIN_S = 20
+ACCOUNT_PAUSE_MAX_S = 60
+
+# --- прокси: False = свой IP ---
+PROXY_ENABLED = False
+PROXY_HOST = "residential-x.bpproxy.at"
+PROXY_PORT = 1000
+PROXY_USER = "bpuser-1F9JCP7H"
+PROXY_PASS_TEMPLATE = "DfhAX0mJ4DYNer20Akwx_session-{session}_lifetime-{lifetime}"
+PROXY_SESSION_LEN = 8
+PROXY_LIFETIME_MIN = 30
+VERIFY_PROXY_IP = True
+CHECK_IP_URL = "https://api.ipify.org"
+
+# --- навигация ---
+NAVIGATE_VIA_HOME = False
+HOME_URL = "https://www.roblox.com/"
+URL = "https://www.roblox.com/CreateAccount"
+
+# ═══ АНТИДЕТЕКТ ЖЕЛЕЗА ═══
+SCREEN_POOL = [
+    (1920, 1080), (1366, 768), (1536, 864), (1440, 900),
+    (1600, 900), (1280, 720), (2560, 1440), (1680, 1050),
+]
+CPU_CORES_POOL = [4, 6, 8, 12, 16]
+WINDOW_SCALE_MIN = 0.75
+WINDOW_SCALE_MAX = 1.0
+MANUAL_TIMEZONE = None
+MANUAL_LOCALE = None
+OS_LIST = ["windows"]
+HW_ARGS = {"screen_max", "screen_min", "hardware_concurrency", "window"}
+
+# --- username ---
+USERNAME_PREFIX = "leshamiga"
+USERNAME_SUFFIX_LEN = 6
+USERNAME_MAX_TRIES = 8
+USERNAME_VALIDATION_WAIT_MAX = 3000
+USERNAME_VALIDATION_POLL_MS = 100
+
+# --- браузер ---
+HEADLESS = False
+HUMANIZE = False
+GEOIP = False
+BLOCK_WEBRTC = True
+
+FIREFOX_USER_PREFS = {
+    "security.webauth.webauthn": False,
+    "security.webauth.webauthn_enable_softtoken": False,
+    "security.webauth.webauthn_enable_usbtoken": False,
+    "security.webauth.u2f": False,
+    "media.peerconnection.enabled": False,
+    "toolkit.telemetry.enabled": False,
+    "toolkit.telemetry.unified": False,
+    "toolkit.telemetry.archive.enabled": False,
+    "toolkit.telemetry.bhrPing.enabled": False,
+    "toolkit.telemetry.newProfilePing.enabled": False,
+    "toolkit.telemetry.updateping.enabled": False,
+    "datareporting.healthreport.uploadEnabled": False,
+    "datareporting.policy.dataSubmissionEnabled": False,
+    "browser.ping-centre.telemetry": False,
+    "browser.newtabpage.activity-stream.feeds.telemetry": False,
+    "browser.newtabpage.activity-stream.telemetry": False,
+    "app.update.auto": False,
+    "app.update.enabled": False,
+    "browser.shell.checkDefaultBrowser": False,
+    "browser.startup.homepage_override.mstone": "ignore",
+    "browser.safebrowsing.malware.enabled": False,
+    "browser.safebrowsing.phishing.enabled": False,
+    "browser.safebrowsing.downloads.enabled": False,
+    "browser.tabs.crashReporting.sendReport": False,
+    "dom.webdriver.enabled": False,
+    "media.eme.enabled": True,
+}
+
+DISMISS_PASSKEY_MODAL = True
+PASSKEY_DECLINE_TEXTS = (
+    "Not now", "Not right now", "No thanks",
+    "Skip", "Skip for now", "Maybe later", "Cancel",
+)
+MODAL_POLL_EVERY = 2
+
+# ═══ ПАУЗЫ (сек) — человеческая реакция ═══
+PAUSE_FORM_LOAD_MIN = 0.8
+PAUSE_FORM_LOAD_MAX = 2.0
+PAUSE_BETWEEN_FIELDS_MIN = 0.35
+PAUSE_BETWEEN_FIELDS_MAX = 1.2
+PAUSE_BEFORE_SUBMIT_MIN = 0.6
+PAUSE_BEFORE_SUBMIT_MAX = 1.8
+PAUSE_BEFORE_NEXT_MIN = 0.4
+PAUSE_BEFORE_NEXT_MAX = 1.2
+PAUSE_READ_ERROR_MIN = 0.6
+PAUSE_READ_ERROR_MAX = 1.6
+
+# ═══ МЫШЬ: биомеханика руки ═══
+MOUSE_STEP_MIN_MS = 8
+MOUSE_STEP_MAX_MS = 16
+MOUSE_JITTER = 1.4
+MOUSE_JITTER_MID_BOOST = 1.8
+MOUSE_OFFSET_FACTOR = 0.40
+MOUSE_OFFSET_VARIANCE = 0.18
+MOUSE_CURVE_MIN_DIV = 38
+MOUSE_CURVE_MAX_DIV = 22
+MOUSE_MIN_STEPS = 8
+MOUSE_SETTLE_MIN_MS = 80
+MOUSE_SETTLE_MAX_MS = 220
+MOUSE_OVERSHOOT_PROB = 0.12
+
+# ═══ КЛИК ═══
+CLICK_AIM_MIN = 0.32
+CLICK_AIM_MAX = 0.68
+CLICK_AIM_DELAY_MIN = 120
+CLICK_AIM_DELAY_MAX = 320
+CLICK_AIM_HESITATE_PROB = 0.06
+CLICK_AIM_HESITATE_MIN = 400
+CLICK_AIM_HESITATE_MAX = 1000
+CLICK_HOLD_MIN_MS = 55
+CLICK_HOLD_MAX_MS = 120
+CLICK_AFTER_MIN_MS = 80
+CLICK_AFTER_MAX_MS = 220
+CLICK_FALLBACK_TIMEOUT = 2000
+SCROLL_INTO_VIEW_TIMEOUT = 1200
+
+# ═══ ПЕЧАТЬ: 55-110 мс/знак, bursts ═══
+TYPE_INITIAL_PAUSE_MIN = 250
+TYPE_INITIAL_PAUSE_MAX = 600
+TYPE_BASE_MIN = 55
+TYPE_BASE_MAX = 110
+TYPE_BASE_MULT_MIN = 0.55
+TYPE_BASE_MULT_MAX = 1.8
+TYPE_THINK_PROB = 0.05
+TYPE_THINK_MIN = 350
+TYPE_THINK_MAX = 900
+TYPE_AFTER_MIN = 150
+TYPE_AFTER_MAX = 350
+TYPE_TYPO_PROB = 0.06
+TYPE_TYPO_PAUSE_MIN = 300
+TYPE_TYPO_PAUSE_MAX = 650
+TYPE_CORRECT_PAUSE_MIN = 180
+TYPE_CORRECT_PAUSE_MAX = 380
+
+# ═══ SELECT ═══
+SELECT_OPEN_PAUSE_MIN = 300
+SELECT_OPEN_PAUSE_MAX = 700
+SELECT_OPTION_TIMEOUT = 2000
+SELECT_AFTER_PAUSE_MIN = 150
+SELECT_AFTER_PAUSE_MAX = 350
+SELECT_ARROW_PAUSE_MIN = 70
+SELECT_ARROW_PAUSE_MAX = 180
+SELECT_KEYBOARD = True
+
+# ═══ RADIX ═══
+RADIX_OPEN_TIMEOUT = 3000
+RADIX_CLICK_SETTLE_MIN = 150
+RADIX_CLICK_SETTLE_MAX = 350
+RADIX_RETRY_PAUSE = 250
+RADIX_TYPEAHEAD_DELAY = 55
+
+# ═══ MULTI-PART ═══
+NEXT_WAIT_PART_TIMEOUT_S = 20
+NEXT_CLICK_PAUSE_MIN = 400
+NEXT_CLICK_PAUSE_MAX = 1000
+
+# --- токен ---
+SAVE_ROBLOSECURITY = True
+TOKENS_FILE = "tokens.txt"
+SAVE_FULL_COOKIES = False
+COOKIES_DIR = "cookies"
+
+# --- сервисные ---
+PAGE_LOAD_TIMEOUT = 60000
+FORM_WAIT_TIMEOUT_S = 3
+SUBMIT_WAIT_TIMEOUT_MS = 2000
+CAPTCHA_WAIT_SECONDS = 300
+CAPTCHA_POLL_INTERVAL_MS = 1000
+SHOTS_DIR = "screenshots"
+DEBUG = "--debug" in sys.argv
+
+# ═══════════════════════════════════════════════════════════════════════
+
+MONTH_ABBR = {1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
+              7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
+MONTH_FULL = {1: "January", 2: "February", 3: "March", 4: "April", 5: "May",
+              6: "June", 7: "July", 8: "August", 9: "September", 10: "October",
+              11: "November", 12: "December"}
+
+USERNAME_ERROR_MARKERS = (
+    "not appropriate", "already in use", "not allowed", "taken",
+    "invalid", "can only contain", "too short", "too long",
+    "doesn't follow", "keep it clean", "won't work",
+)
+
+USERNAME_SELECTORS = (
+    "#signup-username",
+    "input[data-testid*='username']",
+    "input[name='username']",
+)
+PASSWORD_SELECTORS = (
+    "#signup-password",
+    "input[type='password']",
+)
+NEXT_SELECTORS = (
+    "button:has-text('Next')",
+    "button:has-text('Continue')",
+    "[data-testid*='next-button']",
+    "[data-testid*='continue']",
+    "button[type='submit']",
+)
+CLOSE_MODAL_SELECTORS = (
+    "[role='dialog'] button[aria-label='Close']",
+    "[role='dialog'] button[aria-label='close']",
+    "[role='dialog'] button[aria-label*='lose']",
+)
+
+
+class AccountCrash(Exception):
+    pass
+
+
+def log(msg, level="INFO"):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {msg}")
+
+def dbg(msg):
+    if DEBUG:
+        print(f"  [debug] {msg}")
+
+def shot(page, name):
+    if not DEBUG:
+        return
+    Path(SHOTS_DIR).mkdir(exist_ok=True)
+    try:
+        f = Path(SHOTS_DIR) / f"{datetime.now().strftime('%H%M%S')}_{name}.png"
+        page.screenshot(path=str(f), full_page=True)
+    except Exception:
+        pass
+
+def dump_html(page, name):
+    try:
+        html = page.evaluate("() => document.body.outerHTML.slice(-120000)")
+        Path(f"debug_{name}.html").write_text(html, encoding="utf-8")
+        log(f"📄 Дамп → debug_{name}.html", "WARN")
+    except Exception:
+        pass
+
+def human_pause(page, min_s, max_s):
+    page.wait_for_timeout(int(random.uniform(min_s, max_s) * 1000))
+
+def _is_browser_crash(e):
+    if TargetClosedError is not None and isinstance(e, TargetClosedError):
+        return True
+    s = f"{type(e).__name__}: {e}"
+    return ("Target page, context or browser has been closed" in s
+            or "TargetClosedError" in s
+            or "browser has been closed" in s.lower()
+            or "browser has crashed" in s.lower()
+            or "Target crashed" in s)
+
+
+# ---------- прокси ----------
+
+def new_proxy():
+    session = "".join(secrets.choice(string.ascii_lowercase + string.digits)
+                      for _ in range(PROXY_SESSION_LEN))
+    password = PROXY_PASS_TEMPLATE.format(session=session,
+                                          lifetime=PROXY_LIFETIME_MIN)
+    return ({"server": f"http://{PROXY_HOST}:{PROXY_PORT}",
+             "username": PROXY_USER, "password": password}, session)
+
+def log_exit_ip(page):
+    if not VERIFY_PROXY_IP:
+        return
+    try:
+        page.goto(CHECK_IP_URL, wait_until="domcontentloaded", timeout=15000)
+        ip = page.locator("body").inner_text().strip()[:64]
+        log(f"🌐 Выходной IP: {ip}")
+    except Exception as e:
+        log(f"⚠️  Не проверил IP ({e.__class__.__name__})", "WARN")
+
+
+# ---------- фингерпринт ----------
+
+def make_fingerprint():
+    sw, sh = random.choice(SCREEN_POOL)
+    scale = random.uniform(WINDOW_SCALE_MIN, WINDOW_SCALE_MAX)
+    ww = max(800, int(sw * scale) // 2 * 2)
+    wh = max(600, int(sh * scale) // 2 * 2)
+    ww = min(ww, sw)
+    wh = min(wh, sh)
+    return {"screen": (sw, sh), "window": (ww, wh),
+            "cores": random.choice(CPU_CORES_POOL)}
+
+
+# ---------- генераторы ----------
+
+def random_username():
+    alphabet = string.ascii_letters + string.digits
+    return USERNAME_PREFIX + "".join(
+        secrets.choice(alphabet) for _ in range(USERNAME_SUFFIX_LEN))
+
+def random_password():
+    while True:
+        pwd = "".join(secrets.choice(
+            string.ascii_letters + string.digits + "!@#$"
+        ) for _ in range(16))
+        if (any(c.isupper() for c in pwd)
+                and any(c.islower() for c in pwd)
+                and any(c.isdigit() for c in pwd)):
+            return pwd
+
+def random_birth():
+    return {"month": secrets.randbelow(12) + 1,
+            "day":   secrets.randbelow(28) + 1,
+            "year":  secrets.randbelow(7) + 2000}
+
+def random_gender():
+    return secrets.choice(["Male", "Female"])
+
+def get_roblosecurity(page):
+    try:
+        cookies = page.context.cookies()
+    except Exception:
+        return None
+    for c in cookies:
+        if c.get("name") == ".ROBLOSECURITY":
+            return c.get("value")
+    return None
+
+def save_account(username, password, birth, gender, token=None):
+    birth_str = f"{MONTH_ABBR[birth['month']]}-{birth['day']:02d}-{birth['year']}"
+    line = f"{username}:{password}:{birth_str}:{gender.lower()}"
+    if token:
+        line += f":{token}"
+    with open("accounts.txt", "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    if token:
+        with open(TOKENS_FILE, "a", encoding="utf-8") as f:
+            f.write(token + "\n")
+    file = Path("accounts.json")
+    accounts = []
+    if file.exists():
+        try:
+            accounts = json.loads(file.read_text(encoding="utf-8"))
+        except Exception:
+            accounts = []
+    accounts.append({"username": username, "password": password,
+                     "birth": birth_str, "gender": gender.lower(),
+                     "roblosecurity": token,
+                     "created_at": datetime.now().isoformat()})
+    file.write_text(json.dumps(accounts, indent=2, ensure_ascii=False),
+                    encoding="utf-8")
+    if token:
+        log(f"💾 Сохранено: {username}:{password} | 🔑 токен → {TOKENS_FILE}")
+    else:
+        log(f"💾 Сохранено: {username}:{password} (без токена)")
+
+
+# ---------- поиск видимых / модалки ----------
+
+def find_visible(page, sels):
+    if isinstance(sels, str):
+        sels = (sels,)
+    for sel in sels:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                return sel
+        except Exception:
+            continue
+    return None
+
+def wait_for_any_visible(page, sels, timeout_s=20):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if DISMISS_PASSKEY_MODAL:
+            decline_passkey(page)
+        found = find_visible(page, sels)
+        if found:
+            return found
+        page.wait_for_timeout(150)
+    return None
+
+def advance_to_next_part(page):
+    human_pause(page, PAUSE_BEFORE_NEXT_MIN, PAUSE_BEFORE_NEXT_MAX)
+    for sel in NEXT_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if (loc.count() > 0 and loc.is_visible()
+                    and loc.is_enabled()):
+                human_click(page, sel)
+                page.wait_for_timeout(
+                    random.randint(NEXT_CLICK_PAUSE_MIN, NEXT_CLICK_PAUSE_MAX))
+                dbg(f"Next: '{sel}'")
+                return True
+        except Exception:
+            continue
+    return False
+
+def decline_passkey(page):
+    if not DISMISS_PASSKEY_MODAL:
+        return False
+    for txt in PASSKEY_DECLINE_TEXTS:
+        for scope in ("[role='dialog'] ", ""):
+            sel = f"{scope}button:has-text('{txt}')"
+            try:
+                loc = page.locator(sel).first
+                if loc.count() > 0 and loc.is_visible():
+                    human_click(page, sel)
+                    page.wait_for_timeout(200)
+                    log(f"🚫 Отклонил passkey/upsell-модалку ('{txt}')")
+                    return True
+            except Exception:
+                continue
+    for sel in CLOSE_MODAL_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                human_click(page, sel)
+                page.wait_for_timeout(150)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ВВОД НИКА: очистка + валидация (обе функции восстановлены в v28)
+# ─────────────────────────────────────────────────────────────────────────
+
+def _field_value(page, sel):
+    """Текущее значение input (мгновенно, без ожиданий)."""
+    try:
+        return page.locator(sel).first.evaluate("el => el.value || ''")
+    except Exception:
+        return None
+
+def clear_field(page, sel, tries=3):
+    """Очищает поле ПОЛНОСТЬЮ и проверяет пустоту."""
+    for _ in range(tries):
+        try:
+            human_click(page, sel)
+            page.wait_for_timeout(random.randint(80, 180))
+            page.keyboard.press("Control+A")
+            page.wait_for_timeout(random.randint(90, 200))
+            page.keyboard.press("Delete")
+            page.wait_for_timeout(random.randint(80, 160))
+            if _field_value(page, sel) == "":
+                return True
+            # запасной путь: тройной клик = выделить всё в input
+            try:
+                page.locator(sel).first.click(
+                    click_count=3, timeout=CLICK_FALLBACK_TIMEOUT)
+                page.wait_for_timeout(random.randint(80, 160))
+                page.keyboard.press("Delete")
+                page.wait_for_timeout(random.randint(60, 120))
+            except Exception:
+                pass
+            if _field_value(page, sel) == "":
+                return True
+        except Exception:
+            continue
+    return False
+
+def read_username_validation(page):
+    """Текст валидации ника из DOM → (is_error, text)."""
+    for sel in ("#signup-usernameInputValidation",
+                "#signup-username-v2-input-validation",
+                "[data-testid='usernameInputValidation']"):
+        try:
+            loc = page.locator(sel).first
+            if loc.count() == 0 or not loc.is_visible():
+                continue
+            txt = loc.inner_text(timeout=300).strip()
+            if txt:
+                low = txt.lower()
+                is_err = ("is valid" not in low) or (
+                    any(m in low for m in USERNAME_ERROR_MARKERS))
+                return (is_err, txt)
+        except Exception:
+            continue
+    return (False, "")
+
+def wait_username_validation(page):
+    """Ждёт вердикт формы (debounce Roblox ~0.5-1с)."""
+    deadline = time.time() + USERNAME_VALIDATION_WAIT_MAX / 1000
+    while time.time() < deadline:
+        is_err, txt = read_username_validation(page)
+        if txt:
+            return is_err, txt
+        page.wait_for_timeout(USERNAME_VALIDATION_POLL_MS)
+    return (False, "")
+
+def fill_username(page, birth):
+    sel = find_visible(page, USERNAME_SELECTORS) or USERNAME_SELECTORS[0]
+    for attempt in range(1, USERNAME_MAX_TRIES + 1):
+        nick = random_username()
+        log(f"  Ник {attempt}/{USERNAME_MAX_TRIES}: {nick}")
+        # гарантированно пустое поле ПЕРЕД вводом
+        if not clear_field(page, sel):
+            dbg("поле не очистилось — пробую всё равно")
+        human_type(page, sel, nick)
+        # страховка: в поле должен лежать РОВНО наш ник (не склейка)
+        val = _field_value(page, sel)
+        if val is not None and val != nick:
+            log(f"  ⚠️  В поле {len(val)} симв. вместо {len(nick)} — "
+                f"склейка, очищаю и заново", "WARN")
+            clear_field(page, sel)
+            continue
+        is_err, txt = wait_username_validation(page)
+        if not is_err:
+            if txt:
+                dbg(f"валидация: '{txt}'")
+            return nick
+        log(f"  ⚠️  Форма отклонила: {txt}", "WARN")
+        human_pause(page, PAUSE_READ_ERROR_MIN, PAUSE_READ_ERROR_MAX)
+        clear_field(page, sel)
+    return None
+
+
+# ---------- мышь: биомеханика ----------
+
+MOUSE = {"x": None, "y": None}
+
+def _bezier(p0, p1, p2, t):
+    x = (1 - t) ** 2 * p0[0] + 2 * (1 - t) * t * p1[0] + t ** 2 * p2[0]
+    y = (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * p1[1] + t ** 2 * p2[1]
+    return x, y
+
+def _move_along(page, p0, p1, p2):
+    dist = math.hypot(p2[0]-p0[0], p2[1]-p0[1])
+    steps = random.randint(
+        max(MOUSE_MIN_STEPS, int(dist / MOUSE_CURVE_MIN_DIV)),
+        max(MOUSE_MIN_STEPS + 3, int(dist / MOUSE_CURVE_MAX_DIV)))
+    for i in range(1, steps + 1):
+        t = i / steps
+        te = t * t * (3 - 2 * t)
+        te += random.uniform(-0.03, 0.03) * (1 - abs(2*t - 1))
+        te = max(0.0, min(1.0, te))
+        bx, by = _bezier(p0, p1, p2, te)
+        jf = MOUSE_JITTER * (1 + (MOUSE_JITTER_MID_BOOST - 1)
+                             * math.sin(math.pi * t))
+        bx += random.uniform(-jf, jf)
+        by += random.uniform(-jf, jf)
+        try:
+            page.mouse.move(bx, by)
+        except Exception:
+            pass
+        step_ms = random.randint(MOUSE_STEP_MIN_MS, MOUSE_STEP_MAX_MS)
+        if t > 0.75:
+            step_ms += random.randint(4, 14)
+        page.wait_for_timeout(step_ms)
+
+def human_move(page, x, y):
+    if MOUSE["x"] is None:
+        MOUSE["x"] = x + random.randint(-350, 350)
+        MOUSE["y"] = y + random.randint(-250, 250)
+        try:
+            page.mouse.move(MOUSE["x"], MOUSE["y"])
+        except Exception:
+            pass
+    p0 = (MOUSE["x"], MOUSE["y"])
+    p2 = (x + random.uniform(-2, 2), y + random.uniform(-2, 2))
+    dx, dy = p2[0] - p0[0], p2[1] - p0[1]
+    dist = max(1.0, math.hypot(dx, dy))
+    off = random.uniform(
+        MOUSE_OFFSET_FACTOR - MOUSE_OFFSET_VARIANCE,
+        MOUSE_OFFSET_FACTOR + MOUSE_OFFSET_VARIANCE) * dist
+    if random.random() < 0.5:
+        off = -off
+    p1 = ((p0[0] + p2[0]) / 2 - dy / dist * off,
+          (p0[1] + p2[1]) / 2 + dx / dist * off)
+    _move_along(page, p0, p1, p2)
+    if random.random() < MOUSE_OVERSHOOT_PROB:
+        over = random.uniform(5, 16)
+        ang = math.atan2(dy, dx)
+        po = (p2[0] + math.cos(ang) * over + random.uniform(-3, 3),
+              p2[1] + math.sin(ang) * over + random.uniform(-3, 3))
+        _move_along(page, p2, p2, po)
+        page.wait_for_timeout(random.randint(60, 140))
+        _move_along(page, po, po, p2)
+    MOUSE["x"], MOUSE["y"] = p2
+    page.wait_for_timeout(
+        random.randint(MOUSE_SETTLE_MIN_MS, MOUSE_SETTLE_MAX_MS))
+
+def human_click(page, sel, aim="center"):
+    loc = page.locator(sel).first
+    try:
+        loc.scroll_into_view_if_needed(timeout=SCROLL_INTO_VIEW_TIMEOUT)
+    except Exception:
+        pass
+    box = None
+    try:
+        box = loc.bounding_box()
+    except Exception:
+        pass
+    if not box:
+        try:
+            loc.click(timeout=CLICK_FALLBACK_TIMEOUT)
+        except Exception:
+            pass
+        return
+    if aim == "center":
+        x = box["x"] + box["width"] * random.uniform(CLICK_AIM_MIN, CLICK_AIM_MAX)
+        y = box["y"] + box["height"] * random.uniform(CLICK_AIM_MIN, CLICK_AIM_MAX)
+    else:
+        x = box["x"] + box["width"] / 2
+        y = box["y"] + box["height"] / 2
+    human_move(page, x, y)
+    if random.random() < CLICK_AIM_HESITATE_PROB:
+        page.wait_for_timeout(
+            random.randint(CLICK_AIM_HESITATE_MIN, CLICK_AIM_HESITATE_MAX))
+    else:
+        page.wait_for_timeout(
+            random.randint(CLICK_AIM_DELAY_MIN, CLICK_AIM_DELAY_MAX))
+    try:
+        page.mouse.down()
+        page.wait_for_timeout(
+            random.randint(CLICK_HOLD_MIN_MS, CLICK_HOLD_MAX_MS))
+        page.mouse.up()
+    except Exception:
+        try:
+            loc.click(timeout=CLICK_FALLBACK_TIMEOUT)
+        except Exception:
+            pass
+        return
+    MOUSE["x"], MOUSE["y"] = x, y
+    page.wait_for_timeout(
+        random.randint(CLICK_AFTER_MIN_MS, CLICK_AFTER_MAX_MS))
+
+def idle_mouse(page):
+    if MOUSE["x"] is None:
+        MOUSE["x"] = random.randint(200, 800)
+        MOUSE["y"] = random.randint(150, 500)
+
+def human_type(page, sel, text):
+    human_click(page, sel)
+    page.wait_for_timeout(
+        random.randint(TYPE_INITIAL_PAUSE_MIN, TYPE_INITIAL_PAUSE_MAX))
+    typo_idx = None
+    if TYPE_TYPO_PROB > 0 and len(text) > 3 and random.random() < TYPE_TYPO_PROB:
+        typo_idx = random.randrange(1, len(text) - 1)
+    for i, ch in enumerate(text):
+        if i == typo_idx:
+            wrong = random.choice(string.ascii_lowercase)
+            if wrong == ch.lower():
+                wrong = "x" if wrong != "x" else "z"
+            try:
+                page.keyboard.type(wrong, delay=0)
+            except Exception:
+                pass
+            page.wait_for_timeout(
+                random.randint(TYPE_TYPO_PAUSE_MIN, TYPE_TYPO_PAUSE_MAX))
+            try:
+                page.keyboard.press("Backspace")
+            except Exception:
+                pass
+            page.wait_for_timeout(
+                random.randint(TYPE_CORRECT_PAUSE_MIN, TYPE_CORRECT_PAUSE_MAX))
+        try:
+            page.keyboard.type(ch, delay=0)
+        except Exception:
+            pass
+        if random.random() < TYPE_THINK_PROB:
+            page.wait_for_timeout(
+                random.randint(TYPE_THINK_MIN, TYPE_THINK_MAX))
+        else:
+            base = random.uniform(TYPE_BASE_MIN, TYPE_BASE_MAX)
+            base *= random.uniform(TYPE_BASE_MULT_MIN, TYPE_BASE_MULT_MAX)
+            if ch.isupper() or ch.isdigit() or not ch.isalnum():
+                base += random.randint(20, 60)
+            page.wait_for_timeout(int(base))
+    page.wait_for_timeout(random.randint(TYPE_AFTER_MIN, TYPE_AFTER_MAX))
+
+
+# ---------- дропдауны ----------
+
+def _native_keyboard_pick(page, sel, target_text):
+    try:
+        loc = page.locator(sel).first
+        value = loc.evaluate(
+            "el => el.selectedOptions[0]?.textContent?.trim() || ''")
+        options = loc.evaluate(
+            "el => Array.from(el.options).map(o => o.textContent.trim())")
+        if target_text not in options:
+            return False
+        cur_idx = options.index(value) if value in options else 0
+        target_idx = options.index(target_text)
+        diff = target_idx - cur_idx
+        if diff == 0:
+            return True
+        key = "ArrowDown" if diff > 0 else "ArrowUp"
+        for _ in range(abs(diff)):
+            page.keyboard.press(key)
+            page.wait_for_timeout(
+                random.randint(SELECT_ARROW_PAUSE_MIN, SELECT_ARROW_PAUSE_MAX))
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(
+            random.randint(SELECT_AFTER_PAUSE_MIN, SELECT_AFTER_PAUSE_MAX))
+        dbg(f"keyboard-pick: '{target_text}' ({abs(diff)} шагов)")
+        return True
+    except Exception:
+        return False
+
+def select_native_human(page, sel, select_values, option_texts, label):
+    loc = page.locator(sel).first
+    human_click(page, sel)
+    page.wait_for_timeout(
+        random.randint(SELECT_OPEN_PAUSE_MIN, SELECT_OPEN_PAUSE_MAX))
+    if SELECT_KEYBOARD:
+        for t in option_texts:
+            if _native_keyboard_pick(page, sel, t):
+                dbg(f"{label}: '{t}' (keyboard)")
+                return True
+    for v in select_values:
+        try:
+            loc.select_option(v, timeout=SELECT_OPTION_TIMEOUT)
+            page.wait_for_timeout(
+                random.randint(SELECT_AFTER_PAUSE_MIN, SELECT_AFTER_PAUSE_MAX))
+            dbg(f"{label}: '{v}' (select_option)")
+            return True
+        except Exception:
+            continue
+    try:
+        loc.evaluate("el => el.focus()")
+        page.wait_for_timeout(80)
+        for t in option_texts:
+            try:
+                loc.select_option(label=t, timeout=1500)
+                dbg(f"{label}: '{t}' (JS-focus fallback)")
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+def select_option_hidden(page, sel, select_values, option_texts, label):
+    loc = page.locator(sel).first
+    for v in select_values:
+        try:
+            loc.select_option(v, timeout=SELECT_OPTION_TIMEOUT)
+            page.wait_for_timeout(
+                random.randint(SELECT_AFTER_PAUSE_MIN, SELECT_AFTER_PAUSE_MAX))
+            dbg(f"{label}: '{v}' (hidden select)")
+            return True
+        except Exception:
+            continue
+    for t in option_texts:
+        try:
+            loc.select_option(label=t, timeout=1500)
+            dbg(f"{label}: '{t}' (hidden select, label)")
+            return True
+        except Exception:
+            continue
+    return False
+
+def close_leftover_popover(page):
+    try:
+        stuck = page.evaluate(
+            "() => !!document.querySelector('[data-radix-popper-content-wrapper]')"
+            " || document.body.style.pointerEvents === 'none'")
+        if stuck:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(150)
+            page.evaluate(
+                "() => { if (document.body.style.pointerEvents === 'none')"
+                " document.body.style.pointerEvents = '';"
+                " document.body.removeAttribute('data-scroll-locked'); }")
+    except Exception:
+        pass
+
+def radix_open(page, container_sel):
+    close_leftover_popover(page)
+    sel = f"{container_sel} button[role='combobox']"
+    if page.locator(sel).count() == 0:
+        return False
+    human_click(page, sel)
+    try:
+        page.locator("[data-radix-popper-content-wrapper]").first.wait_for(
+            state="visible", timeout=RADIX_OPEN_TIMEOUT)
+        return True
+    except Exception:
+        return False
+
+def radix_click_option(page, texts, label):
+    for exact in (True, False):
+        for t in texts:
+            for role in ("[role='option']", "[data-radix-collection-item]",
+                         "[role='menuitemradio']", "[role='menuitem']"):
+                base = (f"{role}:text-is('{t}')" if exact
+                        else f"{role}:has-text('{t}')")
+                try:
+                    if page.locator(base).count() > 0:
+                        human_click(page, base)
+                        page.wait_for_timeout(random.randint(
+                            RADIX_CLICK_SETTLE_MIN, RADIX_CLICK_SETTLE_MAX))
+                        dbg(f"{label}: клик по опции '{t}'")
+                        return True
+                except Exception:
+                    continue
+    for t in texts:
+        try:
+            page.keyboard.type(t, delay=RADIX_TYPEAHEAD_DELAY)
+            page.wait_for_timeout(random.randint(
+                RADIX_CLICK_SETTLE_MIN, RADIX_CLICK_SETTLE_MAX))
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(RADIX_RETRY_PAUSE)
+            dbg(f"{label}: typeahead '{t}'")
+            return True
+        except Exception:
+            continue
+    return False
+
+def radix_verify(page, container_sel, texts):
+    try:
+        loc = page.locator(
+            f"{container_sel} button[role='combobox']").first
+        if loc.count() == 0:
+            return False
+        txt = loc.inner_text(timeout=300).strip()
+        return any(t.lower() in txt.lower() for t in texts)
+    except Exception:
+        return False
+
+def pick_radix(page, container_sel, texts, label):
+    for _attempt in (1, 2):
+        if not radix_open(page, container_sel):
+            close_leftover_popover(page)
+            continue
+        if not radix_click_option(page, texts, label):
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(RADIX_RETRY_PAUSE)
+            continue
+        page.wait_for_timeout(random.randint(
+            RADIX_CLICK_SETTLE_MIN, RADIX_CLICK_SETTLE_MAX))
+        if radix_verify(page, container_sel, texts):
+            return True
+    close_leftover_popover(page)
+    return False
+
+def set_dropdown(page, sel, select_values, option_texts, label):
+    loc = page.locator(sel).first
+    try:
+        tag = loc.evaluate("el => el.tagName.toLowerCase()")
+    except Exception:
+        log(f"⚠️  {label}: {sel} не найден", "WARN")
+        return False
+    if tag == "select":
+        if select_native_human(page, sel, select_values, option_texts, label):
+            return True
+    else:
+        if pick_radix(page, sel, option_texts, label):
+            return True
+    inner = f"{sel} select"
+    try:
+        if page.locator(inner).count() > 0:
+            if select_option_hidden(page, inner, select_values,
+                                    option_texts, label):
+                return True
+    except Exception:
+        pass
+    log(f"⚠️  {label}: не выбралось", "WARN")
+    return False
+
+
+# ---------- общие ----------
+
+def dismiss_cookie_banner(page):
+    for txt in ("Accept All", "I agree", "Accept", "OK"):
+        try:
+            if page.locator(f"button:has-text('{txt}')").count() > 0:
+                human_click(page, f"button:has-text('{txt}')")
+                return
+        except Exception:
+            pass
+
+def wait_for_form(page, timeout_s=None):
+    timeout_s = timeout_s or FORM_WAIT_TIMEOUT_S
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        dismiss_cookie_banner(page)
+        if find_visible(page, ("#signup-username", "#MonthDropdown")):
+            try:
+                page.wait_for_selector(
+                    "#signup-username, #MonthDropdown",
+                    state="visible", timeout=5000)
+                return True
+            except Exception:
+                pass
+        page.wait_for_timeout(200)
+    return False
+
+def select_gender(page, gender):
+    icon = "head-female" if gender == "Female" else "head-male"
+    sels = [
+        f"button:has(span[class*='{icon}'])",
+        f"button[aria-pressed='false']:has-text('{gender}')",
+        f"#{gender}Button",
+    ]
+    for sel in sels:
+        try:
+            if page.locator(sel).count() == 0:
+                continue
+            human_click(page, sel)
+            return True
+        except Exception:
+            continue
+    return False
+
+def read_validations(page):
+    out = {}
+    for key, sel in [
+        ("birthday", "#signup-v2-birthday-error"),
+        ("birthday", "#signup-BirthdayInputValidation"),
+        ("username", "#signup-usernameInputValidation"),
+        ("password", "#signup-passwordInputValidation"),
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() == 0 or not loc.is_visible():
+                continue
+            txt = loc.inner_text(timeout=300).strip()
+            if txt:
+                out[key] = txt
+        except Exception:
+            continue
+    return out
+
+def wait_submit_enabled(page, timeout=None):
+    timeout = timeout or SUBMIT_WAIT_TIMEOUT_MS
+    try:
+        page.wait_for_function(
+            """() => {
+                const b = document.querySelector('#signup-button')
+                       || document.querySelector("button[aria-label='Create account']")
+                       || document.querySelector("button[type='submit']");
+                return b && !b.disabled;
+            }""",
+            timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+def click_submit(page):
+    sels = [
+        "#signup-button",
+        "button[aria-label='Create account']",
+        "button[type='submit']:not([disabled])",
+        "button:has-text('Sign Up')",
+        "button:has-text('Create account')",
+    ]
+    for sel in sels:
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible() and loc.is_enabled():
+                human_click(page, sel)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ТЕЛО СЕССИИ / ЗАПУСК / РЕТРАИ
+# ─────────────────────────────────────────────────────────────────────────
+
+def _session_body(browser, password, birth, gender, t0):
+    m, d, y = birth["month"], birth["day"], birth["year"]
+    page = browser.new_page()
+    MOUSE["x"] = None
+    MOUSE["y"] = None
+
+    if PROXY_ENABLED:
+        log_exit_ip(page)
+
+    if NAVIGATE_VIA_HOME:
+        try:
+            page.goto(HOME_URL, wait_until="domcontentloaded",
+                      timeout=PAGE_LOAD_TIMEOUT)
+            page.wait_for_timeout(random.randint(500, 1200))
+        except Exception:
+            pass
+    log(f"→ {URL}")
+    page.goto(URL, wait_until="domcontentloaded",
+              timeout=PAGE_LOAD_TIMEOUT)
+
+    if not wait_for_form(page):
+        page.reload(wait_until="domcontentloaded")
+        if not wait_for_form(page):
+            log("❌ Форма не появилась", "ERROR")
+            dump_html(page, "no-form")
+            return False
+
+    is_radix = page.locator(
+        "#MonthDropdown button[role='combobox']").count() > 0
+    has_pw_now = find_visible(page, PASSWORD_SELECTORS) is not None
+    variant = ("v2 (Radix)" if is_radix else "v1 (SSR select)") \
+        if has_pw_now else "v3 (multi-part)"
+    log(f"  ✓ Форма готова ({variant}) | {time.time()-t0:.1f}с")
+    shot(page, "00-landing")
+
+    # ---- дата ----
+    if find_visible(page, "#MonthDropdown"):
+        ok_m = set_dropdown(page, "#MonthDropdown",
+                            [MONTH_ABBR[m]],
+                            [MONTH_FULL[m], MONTH_ABBR[m]], "month")
+        human_pause(page, PAUSE_BETWEEN_FIELDS_MIN, PAUSE_BETWEEN_FIELDS_MAX)
+        ok_d = set_dropdown(page, "#DayDropdown",
+                            [f"{d:02d}", str(d)], [str(d), f"{d:02d}"], "day")
+        human_pause(page, PAUSE_BETWEEN_FIELDS_MIN, PAUSE_BETWEEN_FIELDS_MAX)
+        ok_y = set_dropdown(page, "#YearDropdown",
+                            [str(y)], [str(y)], "year")
+        log(f"  {'✓' if ok_m and ok_d and ok_y else '⚠️ '} "
+            f"Дата: m={ok_m} d={ok_d} y={ok_y} | {time.time()-t0:.1f}с")
+        shot(page, "01-birthday")
+    else:
+        log("  → Даты нет, жму Next")
+        advance_to_next_part(page)
+
+    # ---- ник (очистка + защита от склейки) ----
+    if not find_visible(page, USERNAME_SELECTORS):
+        log("  → Ника нет, жму Next")
+        if not advance_to_next_part(page):
+            log("⚠️  Next не найден", "WARN")
+        shot(page, "01b-after-next")
+        if not wait_for_any_visible(
+                page, USERNAME_SELECTORS, NEXT_WAIT_PART_TIMEOUT_S):
+            log("❌ Поле ника не появилось", "ERROR")
+            dump_html(page, "no-username")
+            return False
+
+    username = fill_username(page, birth)
+    if username is None:
+        log(f"❌ Ник не подобран за {USERNAME_MAX_TRIES} попыток", "ERROR")
+        dump_html(page, "username-tries")
+        return False
+    log(f"  ✓ Ник: {username} | {time.time()-t0:.1f}с")
+
+    # ---- пол: часть 1 ----
+    human_pause(page, PAUSE_BETWEEN_FIELDS_MIN, PAUSE_BETWEEN_FIELDS_MAX)
+    gender_done = select_gender(page, gender)
+    if gender_done:
+        log(f"  ✓ Пол (часть 1): {gender} | {time.time()-t0:.1f}с")
+
+    # ---- пароль ----
+    pw_sel = find_visible(page, PASSWORD_SELECTORS)
+    if not pw_sel:
+        log("  → Пароля нет (multi-part), жму Next")
+        if not advance_to_next_part(page):
+            log("⚠️  Next не найден", "WARN")
+        shot(page, "01c-to-part2")
+        pw_sel = wait_for_any_visible(
+            page, PASSWORD_SELECTORS, NEXT_WAIT_PART_TIMEOUT_S)
+        if not pw_sel:
+            log("❌ Поле пароля не появилось", "ERROR")
+            dump_html(page, "no-password")
+            return False
+
+    human_pause(page, PAUSE_BETWEEN_FIELDS_MIN, PAUSE_BETWEEN_FIELDS_MAX)
+    try:
+        human_type(page, pw_sel, password)
+        log(f"  ✓ Password | {time.time()-t0:.1f}с")
+    except Exception:
+        log("⚠️  Password не заполнился", "WARN")
+        dump_html(page, "password")
+
+    if not gender_done:
+        if select_gender(page, gender):
+            log(f"  ✓ Пол (часть 2): {gender} | {time.time()-t0:.1f}с")
+        else:
+            log("  ✓ Пол пропущен", "WARN")
+
+    shot(page, "02-filled")
+
+    errs = read_validations(page)
+    if "username" in errs:
+        log(f"  ⚠️  Ошибка ника: {errs['username']}", "WARN")
+        clear_field(page, USERNAME_SELECTORS[0])
+        username = fill_username(page, birth)
+        if username is None:
+            return False
+
+    wait_submit_enabled(page)
+
+    human_pause(page, PAUSE_BEFORE_SUBMIT_MIN, PAUSE_BEFORE_SUBMIT_MAX)
+    if not click_submit(page):
+        try:
+            page.locator(pw_sel).press("Enter")
+        except Exception:
+            log("⚠️  Сабмит вручную", "WARN")
+
+    log("⏳ Жду капчу/результат...")
+
+    success = False
+    polls = CAPTCHA_WAIT_SECONDS * 1000 // CAPTCHA_POLL_INTERVAL_MS
+    for i in range(polls):
+        page.wait_for_timeout(CAPTCHA_POLL_INTERVAL_MS)
+        if i % MODAL_POLL_EVERY == 0 and DISMISS_PASSKEY_MODAL:
+            decline_passkey(page)
+        if "createaccount" not in page.url.lower():
+            success = True
+            break
+
+    if success:
+        log(f"✅ Аккаунт зарегистрирован! URL: {page.url}")
+        page.wait_for_timeout(random.randint(800, 1600))
+        decline_passkey(page)
+        shot(page, "03-success")
+
+        token = get_roblosecurity(page) if SAVE_ROBLOSECURITY else None
+        if token:
+            log(f"🔑 .ROBLOSECURITY: {token[:40]}... ({len(token)} симв.)")
+        else:
+            log("⚠️  Кука .ROBLOSECURITY не найдена", "WARN")
+
+        if SAVE_FULL_COOKIES:
+            try:
+                Path(COOKIES_DIR).mkdir(exist_ok=True)
+                (Path(COOKIES_DIR) / f"{username}_cookies.json").write_text(
+                    json.dumps(page.context.cookies(), indent=2),
+                    encoding="utf-8")
+            except Exception:
+                pass
+
+        save_account(username, password, birth, gender, token)
+        return True
+
+    log("❌ Не зарегистрировалось.", "ERROR")
+    errs = read_validations(page)
+    if errs:
+        log(f"   Ошибки: {errs}")
+    shot(page, "03-timeout")
+    return False
+
+
+def _run_session(base_kwargs, password, birth, gender, t0):
+    attempt_kwargs = dict(base_kwargs)
+    while True:
+        body_started = False
+        try:
+            with Camoufox(**attempt_kwargs) as browser:
+                body_started = True
+                return _session_body(browser, password, birth, gender, t0)
+        except TypeError as e:
+            if body_started:
+                raise
+            mt = re.search(r"unexpected keyword argument '(\w+)'", str(e))
+            if not mt or mt.group(1) not in attempt_kwargs:
+                raise
+            bad = mt.group(1)
+            attempt_kwargs.pop(bad)
+            dbg(f"Camoufox не знает '{bad}' — убираю")
+            if bad in HW_ARGS:
+                log(f"⚠️  '{bad}' не поддерживается — обнови пакет", "WARN")
+            continue
+        except Exception as e:
+            if body_started and _is_browser_crash(e):
+                raise AccountCrash(f"{type(e).__name__}: {e}") from e
+            raise
+
+
+def create_account(index, total):
+    t0 = time.time()
+    password = random_password()
+    birth = random_birth()
+    gender = random_gender()
+    m, d, y = birth["month"], birth["day"], birth["year"]
+
+    for attempt in range(1, ACCOUNT_RETRIES + 1):
+        proxy, session = (new_proxy() if PROXY_ENABLED else (None, "-"))
+        fp = make_fingerprint()
+        sw, sh = fp["screen"]
+        ww, wh = fp["window"]
+
+        log("=" * 55)
+        tag = f"попытка {attempt}/{ACCOUNT_RETRIES}" if attempt > 1 else "старт"
+        log(f"АККАУНТ {index}/{total} | сессия {session} | {tag}")
+        log(f"Пароль: {password} | Дата: {MONTH_FULL[m]} {d}, {y} | "
+            f"Пол: {gender}")
+        log(f"Железо: экран {sw}x{sh}, окно {ww}x{wh}, CPU {fp['cores']} ядер")
+        log("=" * 55)
+
+        base_kwargs = dict(
+            headless=HEADLESS, humanize=HUMANIZE, geoip=GEOIP,
+            block_webrtc=BLOCK_WEBRTC, os=OS_LIST,
+            screen_max=(sw, sh), screen_min=(sw, sh),
+            window=(int(ww), int(wh)),
+            hardware_concurrency=fp["cores"],
+            firefox_user_prefs=FIREFOX_USER_PREFS,
+            disable_coop=True,
+            i_know_what_im_doing=True,
+        )
+        if MANUAL_TIMEZONE:
+            base_kwargs["timezone"] = MANUAL_TIMEZONE
+        if MANUAL_LOCALE:
+            base_kwargs["locale"] = [MANUAL_LOCALE]
+        if proxy:
+            base_kwargs["proxy"] = proxy
+
+        try:
+            return _run_session(base_kwargs, password, birth, gender, t0)
+        except AccountCrash as e:
+            log(f"💥 Браузер крашнулся: {e}", "ERROR")
+            if attempt < ACCOUNT_RETRIES:
+                log(f"↻ Ретрай ({attempt + 1}/{ACCOUNT_RETRIES}) — "
+                    f"новый IP и железо...")
+                continue
+            log(f"❌ Аккаунт {index}: {ACCOUNT_RETRIES} крашей — сдаюсь",
+                "ERROR")
+            return False
+        except KeyboardInterrupt:
+            raise
+
+
+def main():
+    log(f"План: {ACCOUNTS_TO_CREATE} аккаунт(ов) | "
+        f"прокси: {'ВКЛ' if PROXY_ENABLED else 'выкл (свой IP)'} | плавный режим")
+    created = 0
+    for i in range(1, ACCOUNTS_TO_CREATE + 1):
+        try:
+            if create_account(i, ACCOUNTS_TO_CREATE):
+                created += 1
+        except KeyboardInterrupt:
+            log("⏹  Остановлено пользователем", "WARN")
+            break
+        except Exception as e:
+            log(f"❌ Аккаунт {i} упал: {e.__class__.__name__}: {e}", "ERROR")
+        if i < ACCOUNTS_TO_CREATE:
+            pause = random.randint(ACCOUNT_PAUSE_MIN_S, ACCOUNT_PAUSE_MAX_S)
+            log(f"⏸  Пауза {pause}с...")
+            time.sleep(pause)
+    log("=" * 55)
+    log(f"Итог: создано {created}/{ACCOUNTS_TO_CREATE}")
+    log("=" * 55)
+    input("Enter для выхода...")
+
+
+if __name__ == "__main__":
+    main()
