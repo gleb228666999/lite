@@ -1,0 +1,5184 @@
+добавь во 1 скрипт авторег из 2 скрипта 
+
+1 скрипт:#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+🤖 AutoFarm ULTIMA v6.5 — фермеры
+========================================================================
+ python farm.py       ← РЕГА (30 попыток: 5 себе + ПУЛ) → 🔑байпас → ФАРМ
+ python farm.py farm  ← (автозапуск после вылета) 🔑байпас ПРИНУДИТЕЛЬНО → ФАРМ
+
+ ⚠️ ГЛАВНОЕ v6.5:
+   • MAIN (com.roblox.client) НЕ ФАРМИТ — он только для БАЙПАСА и РЕГИ.
+     Фармят ТОЛЬКО клоны (доп-пакеты), максимум FARMERS_LIMIT.
+   • `farm.py farm` — байпас ПЕРВЫМ шагом, всегда, без проверок свежести.
+   • Рега не теряется: режим farm крутит суточный цикл
+     [байпас → ФАРМ] → [байпас → СЛОТ] → РЕГА → по кругу.
+
+ 🛡 НЕУБИВАЕМОСТЬ: python-краш → рестарт 2мин | сессия Termux закрыта →
+   supervisor (60с) → farm.py farm | Termux убит → root-страж → Termux →
+   supervisor | ребут → страж из /data/adb/service.d (Magisk).
+
+ 👁 ВАТЧДОГ ОКОН: каждые 30 сек поднимает вылетевшие окна фарма/приваток
+   (приватку — с тем же кодом). Что скрипт убил сам — не поднимает.
+
+ 🛑 ОСТАНОВИТЬ ВСЁ: sh ~/farm_stop.sh
+ ▶ ЗАПУСТИТЬ СНОВА: python farm.py (с РЕГИ, STOP снимется сам)
+"""
+
+import subprocess, time, sys, os, re, sqlite3, random, string, json, base64, hashlib
+import threading, traceback, requests, signal
+import html as html_mod
+import email.utils as eut
+from datetime import datetime, timezone, timedelta
+from collections import Counter
+
+# ============================================================
+# ⚙️ КОНФИГ
+# ============================================================
+PHONE_ID   = (os.environ.get("PHONE_ID", "") or "phone-1").strip()
+PHONE_ROLE = os.environ.get("PHONE_ROLE", "farmer")
+VERBOSE_LOG = os.environ.get("VERBOSE_LOG", "0") == "1"
+
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "") or ""
+TG_CHAT_ID   = os.environ.get("TG_CHAT_ID", "")   or ""
+
+GH_TOKEN   = os.environ.get("GH_TOKEN", "")   or "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"
+GH_REPO    = os.environ.get("GH_REPO", "")    or "gleb228-cucu/kak"
+GH_BRANCH  = "main"
+FLEET_DIR  = "fleet"
+
+SERVERS_JSON_URL = "https://raw.githubusercontent.com/staffere228-alt/vanna/refs/heads/main/bank12"
+FARM_LUA_CONTENT    = "loadstring(game:HttpGet('https://raw.githubusercontent.com/staffere228-alt/vanna/refs/heads/main/farm.lua'))()"
+HARVEST_LUA_CONTENT = "loadstring(game:HttpGet('https://raw.githubusercontent.com/staffere228-alt/ageaeg/refs/heads/main/trade.lua'))()"
+NOOP_LUA = "-- farm: idle"
+
+GROUP_SIZE            = int(os.environ.get("GROUP_SIZE", "4"))
+NUM_COLLECTORS        = int(os.environ.get("NUM_COLLECTORS", "3"))
+FARMERS_PER_COLLECTOR = int(os.environ.get("FARMERS_PER_COLLECTOR", "10"))
+FARM_GROUP_BASE       = int(os.environ.get("FARM_GROUP_BASE", "39"))
+
+MSK_UTC_OFFSET   = 3
+HARVEST_MSK_HOUR = int(os.environ.get("HARVEST_MSK_HOUR", "20"))
+HARVEST_UTC_HOUR = (HARVEST_MSK_HOUR - MSK_UTC_OFFSET) % 24
+HARVEST_SLOT_MIN = 20
+HARVEST_BATCHES  = 2
+LAUNCH_SETTLE    = 90
+HARVEST_MIN_JOIN_MIN = 3
+
+BYPASS_RETRIES     = 6
+KEY_INJECT_RETRIES = 3
+BYPASS_MIN_GAP_MIN = 25
+
+PKG_MAIN    = "com.roblox.client"
+PLACE_ID    = "142823291"
+OUT_DIR     = "/storage/emulated/0/RobloxFarm"
+COOKIES_F   = os.path.join(OUT_DIR, "cookies.txt")
+ACCOUNTS_F  = os.path.join(OUT_DIR, "accounts.txt")
+STATE_FILE  = os.path.join(OUT_DIR, "farm_state.json")
+ARCHIVE_DIR = os.path.join(OUT_DIR, "archive")
+
+TERMUX_HOME  = os.environ.get("HOME", "/data/data/com.termux/files/home")
+WORK_DB      = os.path.join(TERMUX_HOME, "Cookies_work.db")
+SESSION_GREP = r"roblosecurity|cookie|session|userid|user_id|account|token|credential"
+
+DEFAULT_TARGET    = int(os.environ.get("DEFAULT_TARGET", "5"))
+REG_ATTEMPTS      = int(os.environ.get("REG_ATTEMPTS", "10"))
+MAX_ROUNDS        = int(os.environ.get("MAX_ROUNDS", "3"))
+RATE_LIMIT_PAUSE  = 15 * 60
+ROUND_PAUSE_MIN   = 15
+REGA_ESTIMATE_MIN = 210
+
+POOL_ENABLED   = True
+POOL_CLAIM_TTL = 2 * 3600
+
+HEARTBEAT_PERIOD  = 1800
+STATUS_STALE_MULT = 1.7
+_STALE_SEC = HEARTBEAT_PERIOD * STATUS_STALE_MULT
+
+TG_COOKIE_MIN_LEN = 80
+FARMERS_LIMIT     = int(os.environ.get("FARMERS_LIMIT", "4"))
+
+ZEN_API_KEY         = os.environ.get("ZEN_API_KEY", "") or "bf1816b1-89df-4729-8d0a-654f022330f9"
+ZEN_API_URL         = "https://api.izen.lol/v1/bypass"
+DELTA_AUTOEXEC_PATH = "/storage/emulated/0/Delta/Autoexecute/1.lua"
+KEEP_SCREEN_ON      = True
+MAX_RESTARTS_PER_HOUR = 5
+
+MONITOR_DUTY_ENABLED  = True
+MONITOR_LOCK_PATH     = "monitor_lock.json"
+MONITOR_LOCK_TTL      = 300
+MONITOR_LOCK_TOUCH    = 120
+
+# 🛡 STOP / PID / ватчдог окон
+STOP_FILE     = os.path.join(OUT_DIR, "STOP")
+PID_FILE      = os.path.join(OUT_DIR, "farm.pid")
+WINDOW_CHECK_INTERVAL = 30
+WINDOW_LAUNCH_GRACE   = 60
+WINDOW_MAX_RELANCHES  = 8
+
+# ============================================================
+# 📍 КООРДИНАТЫ — регистрация (экраны Roblox)
+# ============================================================
+TAP_CREATE   = (355, 1025)
+TAP_YEAR     = (558, 478)
+YEAR_TAPS    = int(os.environ.get("YEAR_TAPS", "7"))
+TAP_CONFIRM  = (309, 967)
+TAP_USERNAME = (143, 528)
+TAP_CONTINUE = (338, 881)
+TAP_X        = (637, 506)
+TAP_DONE     = (362, 615)
+TAP_HIDE_KB  = (640, 152)
+
+P_LAUNCH_FIRST      = 20
+P_STEP              = 3
+P_AFTER_TYPE        = 2
+P_CONTINUE          = 10
+P_BEFORE_X          = 20
+P_FIELD_WAIT        = 12
+P_HIDE_KB           = 3
+P_REDRAW            = 1.5
+P_COOKIE_WAIT       = 30
+P_KEY_CHAR          = 0.1
+P_PASSWORD_SETTLE   = 3
+P_KILL_SETTLE       = 2
+P_FORCE_KILL_SETTLE = 5
+SOFT_LOGOUT_SETTLE  = 10
+
+KEYCODE_LOWER = {c: 29 + i for i, c in enumerate("abcdefghijklmnopqrstuvwxyz")}
+KEYCODE_DIGIT = {c: 7 + i for i, c in enumerate("0123456789")}
+
+# ============================================================
+# 📍 КООРДИНАТЫ — байпас (Delta)
+# ============================================================
+LINK_TAP       = (1000, 470)
+CLOSE_TRANSL_1 = (1126, 666)
+TRIGGER_AD     = (600, 700)
+CLOSE_AD       = (1240, 540)
+CONTINUE_1     = (600, 700)
+GOOGLE_ROW     = (470, 100)
+COPY_LINK      = (1023, 213)
+CONTINUE_KEY   = (530, 530)
+CLOSE_TRANSL_2 = (1126, 666)
+COPY_CODE      = (615, 680)
+OMNIBOX_TAP    = (640, 60)
+INPUT_FIELD    = (993, 315)
+ACCEPT_BTN     = (1030, 396)
+
+UI_INITIAL_DELAY  = 20
+COPY_SETTLE_DELAY = 4
+UI_STEP_DELAYS = {
+    "LINK_TAP": 7, "SET_LANDSCAPE": 2, "CLOSE_TRANSL_1": 1,
+    "TRIGGER_AD": 1, "CLOSE_AD": 1, "CONTINUE_1": 2,
+    "GOOGLE_ROW": 1, "COPY_LINK": 3, "OPEN_ZEN_LINK": 30,
+    "CONTINUE_KEY": 6, "CLOSE_TRANSL_2": 1, "COPY_CODE": 3,
+}
+KEY2_POST_LINK_DELAY = 5
+KEY_WRITE_WAIT       = 25
+
+# ============================================================
+# 🗄 СХЕМЫ COOKIE-БАЗ (WebView)
+# ============================================================
+SCHEMA_V94 = """CREATE TABLE cookies(
+    creation_utc INTEGER NOT NULL, top_frame_site_key TEXT NOT NULL,
+    host_key TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL,
+    encrypted_value BLOB DEFAULT '', path TEXT NOT NULL, expires_utc INTEGER NOT NULL,
+    is_secure INTEGER NOT NULL, is_httponly INTEGER NOT NULL, last_access_utc INTEGER NOT NULL,
+    has_expires INTEGER NOT NULL DEFAULT 1, is_persistent INTEGER NOT NULL DEFAULT 1,
+    priority INTEGER NOT NULL DEFAULT 1, samesite INTEGER NOT NULL DEFAULT -1,
+    source_scheme INTEGER NOT NULL DEFAULT 0, source_port INTEGER NOT NULL DEFAULT -1,
+    is_same_party INTEGER NOT NULL DEFAULT 0)"""
+
+SCHEMA_V150 = """CREATE TABLE cookies(
+    creation_utc INTEGER NOT NULL, host_key TEXT NOT NULL, top_frame_site_key TEXT NOT NULL,
+    name TEXT NOT NULL, value TEXT NOT NULL, encrypted_value BLOB NOT NULL,
+    path TEXT NOT NULL, expires_utc INTEGER NOT NULL, is_secure INTEGER NOT NULL,
+    is_httponly INTEGER NOT NULL, last_access_utc INTEGER NOT NULL, has_expires INTEGER NOT NULL,
+    is_persistent INTEGER NOT NULL, priority INTEGER NOT NULL, samesite INTEGER NOT NULL,
+    source_scheme INTEGER NOT NULL, source_port INTEGER NOT NULL, last_update_utc INTEGER NOT NULL,
+    source_type INTEGER NOT NULL, has_cross_site_ancestor INTEGER NOT NULL)"""
+
+# ============================================================
+# 🧠 РАНТАЙМ-СОСТОЯНИЕ
+# ============================================================
+state = {"last_key_time": 0.0, "last_key": "", "done_slots": [], "last_reg_date": ""}
+KEY_RE = re.compile(r'\b(FREE_[A-Za-z0-9_\-]{8,}|[A-Z]{2,10}_[A-Za-z0-9]{16,})\b')
+
+CURRENT_PHASE = ["BOOT"]
+CLOCK_OFFSET  = [0.0]
+_last_drift_alert = [0.0]
+_TG_OFFSET = [0]
+_HB_STARTED   = False
+_TG_CONFLICT  = [False]
+_last_seen    = {}
+_PROCESS_LAUNCH_NUM = [0]
+_last_pool_recheck = [0.0]
+_FLEET_LOCK = threading.Lock()
+
+_m = re.search(r'(\d+)', PHONE_ID)
+PHONE_INDEX = int(_m.group(1)) if _m else 0
+
+_HTTP = requests.Session()
+
+_PUT_SHA_CACHE = {}
+_PKGS_CACHE    = {"ts": 0.0, "pkgs": []}
+_STATS_CACHE   = {"ts": 0.0, "v": ("?", "?", "?")}
+
+_STOPPING = [False]
+_WINDOWS = {}
+_WINDOWS_LOCK = threading.Lock()
+_WATCHDOG_STARTED = [False]
+
+# ============================================================
+# 🛠️ БАЗА
+# ============================================================
+def log(m): print(f"[{datetime.now().strftime('%H:%M:%S')}] {m}", flush=True)
+
+def logv(m):
+    if VERBOSE_LOG:
+        log(m)
+
+def run_su(cmd, timeout=15):
+    try:
+        r = subprocess.run(["su", "-c", cmd], capture_output=True, text=True,
+                           timeout=timeout, errors="replace")
+        return r.returncode == 0, r.stdout.strip(), r.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return False, "", "timeout"
+    except Exception as e:
+        return False, "", str(e)
+
+def tap(x, y, delay=0):
+    run_su(f"input tap {x} {y}", timeout=5)
+    if delay:
+        time.sleep(delay)
+
+def type_text(text, timeout=25):
+    safe = text.replace("'", "'\\''").replace(" ", "%s")
+    ok, _, err = run_su(f"input text '{safe}'", timeout=timeout)
+    if not ok:
+        logv(f"⌨️ input text error: {err}")
+    return ok
+
+def select_all_delete():
+    run_su("input keycombination 113 29", timeout=5)
+    time.sleep(0.3)
+    run_su("input keyevent 67", timeout=5)
+    time.sleep(0.3)
+
+def set_landscape():
+    run_su("settings put system accelerometer_rotation 0", timeout=5)
+    run_su("settings put system user_rotation 1", timeout=5)
+
+def set_portrait():
+    run_su("settings put system user_rotation 0", timeout=5)
+    run_su("settings put system accelerometer_rotation 1", timeout=5)
+
+_UI_CACHE = {"ts": 0.0, "xml": ""}
+
+def ui_cache_clear():
+    _UI_CACHE["xml"] = ""
+    _UI_CACHE["ts"] = 0.0
+
+def ui_dump():
+    if time.time() - _UI_CACHE["ts"] < 1.0:
+        return _UI_CACHE["xml"]
+    ok, out, _ = run_su(
+        "rm -f /data/local/tmp/ui.xml; "
+        "uiautomator dump /data/local/tmp/ui.xml >/dev/null 2>&1; "
+        "cat /data/local/tmp/ui.xml 2>/dev/null", timeout=25)
+    xml = out if (ok and out) else ""
+    _UI_CACHE["ts"] = time.time()
+    _UI_CACHE["xml"] = xml
+    return xml
+
+def get_visible_text():
+    xml = ui_dump()
+    if not xml:
+        return []
+    return [t for raw in re.findall(r'text="([^"]+)"', xml)
+            if (t := html_mod.unescape(raw).strip())]
+
+def _looks_like_url(t):
+    t = t.strip()
+    if not t or len(t) < 8: return False
+    if t.startswith("http") or "://" in t: return True
+    if re.match(r'^(www\.)?[a-z0-9-]+\.[a-z]{2,}([/?].*)?$', t, re.I): return True
+    if re.search(r'(lootlabs|linkvertise|work\.ink|izen|zen\.lol|\.gg/|\.ink/|relay|platorelay)', t, re.I): return True
+    return False
+
+def _normalize_url(t):
+    t = t.strip()
+    return t if t.startswith("http") else "https://" + t
+
+def get_visible_url():
+    for t in get_visible_text():
+        if _looks_like_url(t): return t
+    return ""
+
+def wake_lock():
+    try:
+        subprocess.run(["termux-wake-lock"], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+# ============================================================
+# 📢 TELEGRAM
+# ============================================================
+def tg_send(text, silent=False, retries=3):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    for i in range(retries):
+        try:
+            r = _HTTP.post(url, json={"chat_id": TG_CHAT_ID, "text": str(text)[:4000],
+                                      "disable_notification": silent}, timeout=10)
+            if r.status_code == 200: return True
+            if r.status_code == 429:
+                try:
+                    ra = r.json().get("parameters", {}).get("retry_after", 5)
+                except Exception:
+                    ra = 5
+                time.sleep(ra + 1); continue
+            return False
+        except Exception:
+            time.sleep(2 + i * 2)
+    return False
+
+def tg_send_long(text, silent=False):
+    for i in range(0, len(text), 3800):
+        tg_send(text[i:i + 3800], silent=silent)
+
+def set_phase(name):
+    old = CURRENT_PHASE[0]
+    CURRENT_PHASE[0] = name
+    if old != name:
+        log(f"🔄 {name}")
+    fleet_status_put()
+
+# ============================================================
+# 🕐 ВРЕМЯ
+# ============================================================
+def utc_now():
+    return datetime.now(timezone.utc) + timedelta(seconds=CLOCK_OFFSET[0])
+
+def msk_now():
+    return utc_now() + timedelta(hours=MSK_UTC_OFFSET)
+
+def utc_ts():
+    return time.time() + CLOCK_OFFSET[0]
+
+def measure_clock_offset(apply=True):
+    try:
+        r = _HTTP.head("https://api.github.com", timeout=10)
+        d = r.headers.get("Date")
+        if d:
+            server = eut.parsedate_to_datetime(d)
+            if server.tzinfo is None:
+                server = server.replace(tzinfo=timezone.utc)
+            off = (server - datetime.now(timezone.utc)).total_seconds()
+            if abs(off) > 120 and time.time() - _last_drift_alert[0] > 3600:
+                log(f"🕐 Часы уходят на {off:+.0f}с — скорректировано")
+                _last_drift_alert[0] = time.time()
+            if apply: CLOCK_OFFSET[0] = off
+            return off
+    except Exception:
+        pass
+    return 0.0
+
+def _hour_now():
+    now = utc_now()
+    return now.hour + now.minute / 60.0 + now.second / 3600.0
+
+def utc_slot():
+    h = _hour_now()
+    if h < HARVEST_UTC_HOUR:
+        return "farm", -1
+    for b in range(HARVEST_BATCHES):
+        if h < HARVEST_UTC_HOUR + (b + 1) * HARVEST_SLOT_MIN / 60.0:
+            return "harvest", b
+    return "farm", -1
+
+def harvest_minutes_away():
+    h = _hour_now()
+    if h < HARVEST_UTC_HOUR:
+        return (HARVEST_UTC_HOUR - h) * 60.0
+    return (24.0 - h + HARVEST_UTC_HOUR) * 60.0
+
+def minutes_to_next_boundary():
+    h = _hour_now()
+    bs = [HARVEST_UTC_HOUR] \
+       + [HARVEST_UTC_HOUR + (b + 1) * HARVEST_SLOT_MIN / 60.0 for b in range(HARVEST_BATCHES)] \
+       + [24.0]
+    for b in bs:
+        if h < b - 1e-9:
+            return (b - h) * 60.0
+    return 0.0
+
+def _after_slots_now():
+    return _hour_now() >= HARVEST_UTC_HOUR + HARVEST_BATCHES * HARVEST_SLOT_MIN / 60.0
+
+def wait_out_slot(slot_tuple):
+    while utc_slot() == slot_tuple:
+        check_stop()
+        sleep_stop(max(30.0, minutes_to_next_boundary() * 60 - 90))
+
+# ============================================================
+# 🛑 STOP-МЕХАНИЗМ
+# ============================================================
+class StopFarm(Exception):
+    pass
+
+def stop_requested():
+    try:
+        return os.path.exists(STOP_FILE)
+    except Exception:
+        return False
+
+def check_stop():
+    if stop_requested():
+        raise StopFarm()
+
+def sleep_stop(sec):
+    end = time.time() + max(0.0, sec)
+    while True:
+        check_stop()
+        rem = end - time.time()
+        if rem <= 0:
+            return
+        time.sleep(min(5.0, rem))
+
+def graceful_stop(reason="остановка"):
+    if _STOPPING[0]:
+        return
+    _STOPPING[0] = True
+    try:
+        log(f"🛑 ОСТАНОВКА ({reason})")
+        try:
+            tg_send(f"🛑 {PHONE_ID}: farm.py остановлен ({reason})", silent=False)
+        except Exception:
+            pass
+        try:
+            windows_clear()
+            kill_all_roblox()
+        except Exception:
+            pass
+        try:
+            set_portrait()
+        except Exception:
+            pass
+        try:
+            run_su("svc power stayon false", timeout=5)
+        except Exception:
+            pass
+        release_lock()
+    finally:
+        os._exit(0)
+
+# ============================================================
+# 🔒 SINGLE-INSTANCE
+# ============================================================
+def _proc_cmdline_contains(pid, fragment):
+    try:
+        pid = int(str(pid).strip())
+        if pid <= 0:
+            return False
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read().replace(b"\0", b" ").decode(errors="replace")
+        return fragment in cmd
+    except Exception:
+        return False
+
+def acquire_lock():
+    try:
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE) as f:
+                old = f.read().strip()
+            if old and old != str(os.getpid()) and _proc_cmdline_contains(old, "farm.py"):
+                log(f"⛔ Уже запущен другой farm.py (PID {old}) — выхожу.")
+                log("   Полная остановка: sh ~/farm_stop.sh | запуск: python farm.py")
+                return False
+        with open(PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+        return True
+    except Exception as e:
+        logv(f"⚠️ lock: {e}")
+        return True
+
+def release_lock():
+    try:
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE) as f:
+                p = f.read().strip()
+            if p == str(os.getpid()):
+                os.remove(PID_FILE)
+    except Exception:
+        pass
+
+# ============================================================
+# 🛡 KEEPALIVE (supervisor + .bashrc + root-страж)
+# ============================================================
+KEEPALIVE_MARK = "# === KEEPALIVE: автоподнятие фермы (не удалять) ==="
+
+def _ka_self_path():
+    p = os.path.abspath(sys.argv[0] or "")
+    if os.path.exists(p):
+        return p
+    return os.path.join(os.path.expanduser("~"), "farm.py")
+
+def _ka_install_stopper():
+    home = os.path.expanduser("~")
+    p = os.path.join(home, "farm_stop.sh")
+    body = f"""#!/data/data/com.termux/files/usr/bin/sh
+touch "{STOP_FILE}"
+su -c "touch /data/local/tmp/.farm_stop" 2>/dev/null
+PID="$(cat "{PID_FILE}" 2>/dev/null)"
+[ -n "$PID" ] && kill "$PID" 2>/dev/null
+su -c "pkill -f 'python.*farm[.]py'" 2>/dev/null
+sleep 2
+su -c "pkill -9 -f 'python.*farm[.]py'" 2>/dev/null
+su -c "pkill -f 'keep-termux[.]sh'; pkill -f 'supervisor[.]sh'; rm -f /data/local/tmp/.farm_supervisor.lock" 2>/dev/null
+echo "🛑 Ферма ОСТАНОВЛЕНА (python + supervisor + root-страж)."
+echo "▶ Снова запустить: python ~/farm.py (начнётся с РЕГИ)"
+"""
+    try:
+        with open(p, "w") as f:
+            f.write(body)
+        os.chmod(p, 0o755)
+        return p
+    except Exception as e:
+        logv(f"🛡 farm_stop.sh write: {e}")
+        return None
+
+def _ka_install_supervisor():
+    home = os.path.expanduser("~")
+    self_path = _ka_self_path()
+    script_name = os.path.basename(self_path)
+    py = sys.executable or "python"
+    sup = os.path.join(home, "supervisor.sh")
+    body = f"""#!/data/data/com.termux/files/usr/bin/sh
+# 🛡 KEEPALIVE supervisor — НЕ УДАЛЯТЬ
+# 🛑 Полная остановка: sh {home}/farm_stop.sh
+H="{home}"
+SCRIPT="{self_path}"
+ARG="farm"
+LOG="$H/farm.log"
+STOP="{STOP_FILE}"
+PY="{py}"
+LOCK=/data/local/tmp/.farm_supervisor.lock
+
+[ -x "$PY" ] || PY="$(command -v python || command -v python3)"
+[ -z "$PY" ] && exit 1
+
+sup_other() {{
+    for d in /proc/[0-9]*; do
+        [ "$d" = "/proc/$$" ] && continue
+        c="$(tr '\\0' ' ' < "$d/cmdline" 2>/dev/null)"
+        case "$c" in *supervisor.sh*) return 0 ;; esac
+    done
+    return 1
+}}
+
+py_alive() {{
+    for d in /proc/[0-9]*; do
+        c="$(tr '\\0' ' ' < "$d/cmdline" 2>/dev/null)"
+        case "$c" in *python*"{script_name}"*) return 0 ;; esac
+    done
+    return 1
+}}
+
+[ -f "$STOP" ] && exit 0
+sup_other && exit 0
+echo $$ > "$LOCK" 2>/dev/null; chmod 666 "$LOCK" 2>/dev/null
+sleep 2
+sup_other && exit 0
+
+echo "[$(date '+%F %T')] 👁 supervisor: контролирую {script_name} {ARG}" >> "$LOG"
+while true; do
+    [ -f "$STOP" ] && {{ rm -f "$LOCK" 2>/dev/null; exit 0; }}
+    while py_alive; do
+        [ -f "$STOP" ] && {{ rm -f "$LOCK" 2>/dev/null; exit 0; }}
+        sleep 30
+    done
+    [ -f "$STOP" ] && {{ rm -f "$LOCK" 2>/dev/null; exit 0; }}
+    echo "[$(date '+%F %T')] ⚠️ {script_name} умер → запускаю: {script_name} {ARG}" >> "$LOG"
+    "$PY" "$SCRIPT" $ARG >> "$LOG" 2>&1
+    echo "[$(date '+%F %T')] 💀 exit=$? → рестарт через 60с" >> "$LOG"
+    sleep 60
+    if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 20000000 ]; then
+        tail -n 3000 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
+    fi
+done
+"""
+    try:
+        with open(sup, "w") as f:
+            f.write(body)
+        os.chmod(sup, 0o755)
+        return sup
+    except Exception as e:
+        logv(f"🛡 supervisor write: {e}")
+        return None
+
+def _ka_install_bashrc():
+    home = os.path.expanduser("~")
+    add = ('\nif [ -f "$HOME/supervisor.sh" ]; then\n'
+           '  nohup sh "$HOME/supervisor.sh" >/dev/null 2>&1 &\n'
+           'fi\n')
+    for rc in (".bashrc", ".profile"):
+        p = os.path.join(home, rc)
+        try:
+            existing = ""
+            if os.path.exists(p):
+                with open(p) as f:
+                    existing = f.read()
+            if KEEPALIVE_MARK not in existing:
+                with open(p, "a") as f:
+                    f.write(f"\n{KEEPALIVE_MARK}\n{add}")
+        except Exception as e:
+            logv(f"🛡 {rc} write: {e}")
+
+def _ka_install_root_guard():
+    home = os.path.expanduser("~")
+    script_name = os.path.basename(_ka_self_path())
+    guard_local = os.path.join(home, ".keep_termux.sh")
+    body = f"""#!/system/bin/sh
+# 🛡 KEEPALIVE root-страж. Остановить: farm_stop.sh
+PIDF=/data/local/tmp/.keep_termux.pid
+STOPS="{STOP_FILE} /data/local/tmp/.farm_stop"
+HOME_T="{home}"
+echo $$ > "$PIDF"
+alive() {{
+    pat="$1"
+    for d in /proc/[0-9]*; do
+        [ "$d" = "/proc/$$" ] && continue
+        c="$(/system/bin/tr '\\0' ' ' < "$d/cmdline" 2>/dev/null)"
+        case "$c" in *$pat*) return 0 ;; esac
+    done
+    return 1
+}}
+while true; do
+    stop=0
+    for f in $STOPS; do [ -f "$f" ] && stop=1; done
+    if [ "$stop" = "1" ]; then /system/bin/sleep 60; continue; fi
+    if ! /system/bin/pidof com.termux >/dev/null 2>&1; then
+        /system/bin/am start --user 0 -n com.termux/.app.TermuxActivity >/dev/null 2>&1
+        /system/bin/sleep 45
+        continue
+    fi
+    if alive "python*{script_name}"; then
+        :
+    elif ! alive "supervisor.sh"; then
+        /system/bin/setsid /data/data/com.termux/files/usr/bin/sh \\
+            "$HOME_T/supervisor.sh" >/dev/null 2>&1 &
+    fi
+    /system/bin/sleep 60
+done
+"""
+    try:
+        with open(guard_local, "w") as f:
+            f.write(body)
+        os.chmod(guard_local, 0o755)
+    except Exception as e:
+        logv(f"🛡 guard write: {e}")
+        return None
+
+    ok_test, _, _ = run_su("test -d /data/adb", timeout=10)
+    dest = "/data/adb/service.d/keep-termux.sh" if ok_test else "/data/local/tmp/keep-termux.sh"
+    run_su("kill $(cat /data/local/tmp/.keep_termux.pid 2>/dev/null) 2>/dev/null; "
+           "pkill -f 'keep-termux[.]sh' 2>/dev/null; true", timeout=10)
+    run_su(f"cp '{guard_local}' '{dest}'", timeout=10)
+    run_su(f"chmod 755 '{dest}'", timeout=5)
+    run_su(f"setsid /system/bin/sh '{dest}' >/dev/null 2>&1 &", timeout=10)
+    return dest
+
+def _ka_supervisor_running():
+    ok, out, _ = run_su("pgrep -f 'supervisor[.]sh'", timeout=5)
+    return bool(ok and out.strip())
+
+def keepalive_install():
+    try:
+        _ka_install_supervisor()
+        _ka_install_bashrc()
+        _ka_install_stopper()
+        guard_dest = _ka_install_root_guard()
+        if not _ka_supervisor_running():
+            subprocess.Popen(["sh", os.path.join(os.path.expanduser("~"), "supervisor.sh")],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+            log("🛡 Оживление: supervisor запущен (после вылета поднимет farm.py farm)")
+        else:
+            logv("🛡 Оживление: supervisor уже работает")
+        if guard_dest:
+            logv(f"🛡 Root-страж: {guard_dest}"
+                 + ("" if "/data/adb/" in guard_dest
+                    else " (⚠️ без Magisk: после ребута открой Termux руками)"))
+        log("🛑 Полная остановка: sh ~/farm_stop.sh")
+    except Exception as e:
+        logv(f"🛡 keepalive_install: {e} (не критично)")
+
+# ============================================================
+# 👁 ВАТЧДОГ ОКОН (каждые 30 сек)
+# ============================================================
+def windows_track(pkg, code=None):
+    with _WINDOWS_LOCK:
+        _WINDOWS[pkg] = {"code": code, "ts": time.time(), "fails": 0}
+
+def windows_untrack(pkg):
+    with _WINDOWS_LOCK:
+        _WINDOWS.pop(pkg, None)
+
+def windows_clear():
+    """Снимаем ВСЕ окна с отслеживания — намере‏нный килл (байпас/смена фазы)."""
+    with _WINDOWS_LOCK:
+        _WINDOWS.clear()
+
+def _relaunch_window(pkg, code):
+    if code:
+        log(f"🚑 Окно {pkg} вылетело → поднимаю в ПРИВАТКУ (тот же код)")
+        launch_private(pkg, code)
+    else:
+        log(f"🚑 Окно {pkg} вылетело → поднимаю в плейс")
+        deep = f"'roblox://experiences/start?placeId={PLACE_ID}'"
+        run_su(f"am start -a android.intent.action.VIEW -d {deep} {pkg}", timeout=5)
+
+def windows_watchdog_loop():
+    log(f"👁 Ватчдог окон: проверка каждые {WINDOW_CHECK_INTERVAL} сек (только клоны)")
+    while True:
+        try:
+            time.sleep(WINDOW_CHECK_INTERVAL)
+            if stop_requested():
+                return
+            with _WINDOWS_LOCK:
+                targets = {k: dict(v) for k, v in _WINDOWS.items()}
+            for pkg, info in targets.items():
+                try:
+                    if pkg_alive(pkg):
+                        with _WINDOWS_LOCK:
+                            if pkg in _WINDOWS:
+                                _WINDOWS[pkg]["fails"] = 0
+                        continue
+                    if time.time() - info.get("ts", 0) < WINDOW_LAUNCH_GRACE:
+                        continue
+                    with _WINDOWS_LOCK:
+                        if pkg not in _WINDOWS:
+                            continue
+                        fails = _WINDOWS[pkg].get("fails", 0) + 1
+                        _WINDOWS[pkg]["fails"] = fails
+                        _WINDOWS[pkg]["ts"] = time.time()
+                        code = _WINDOWS[pkg].get("code")
+                    if fails > WINDOW_MAX_RELANCHES:
+                        log(f"👎 {pkg} вылетел {fails}× подряд — снимаю с ватчдога")
+                        tg_send(f"🆘 {PHONE_ID}: {pkg} вылетает подряд ({fails}×) — "
+                                f"окно больше не поднимаю", silent=True)
+                        windows_untrack(pkg)
+                        continue
+                    _relaunch_window(pkg, code)
+                except Exception as e:
+                    logv(f"⚠️ watchdog[{pkg}]: {e}")
+        except Exception as e:
+            logv(f"⚠️ windows watchdog: {e}")
+
+def windows_watchdog_start():
+    if _WATCHDOG_STARTED[0]:
+        return
+    _WATCHDOG_STARTED[0] = True
+    threading.Thread(target=windows_watchdog_loop, daemon=True).start()
+
+# ============================================================
+# ☁️ GITHUB
+# ============================================================
+def gh_api(method, path, body=None):
+    url = f"https://api.github.com/repos/{GH_REPO}/contents/{path}"
+    params = {"ref": GH_BRANCH} if method == "GET" else None
+    headers = {"Authorization": f"Bearer {GH_TOKEN}",
+               "Accept": "application/vnd.github+json", "User-Agent": PHONE_ID}
+    try:
+        r = _HTTP.request(method, url, params=params, json=body, headers=headers, timeout=25)
+        try:
+            j = r.json() if r.content else {}
+        except Exception:
+            j = {}
+        if r.status_code in (401, 403):
+            msg = (j.get("message") or "") if isinstance(j, dict) else ""
+            log(f"⚠️ GitHub {r.status_code}: {msg[:120]}")
+        return r.status_code, j
+    except Exception as e:
+        logv(f"⚠️ GitHub API: {e}")
+        return 0, {}
+
+def gh_get(path):
+    st, j = gh_api("GET", path)
+    if st == 200 and isinstance(j, dict):
+        try:
+            content = base64.b64decode(j.get("content", "")).decode()
+        except Exception:
+            content = ""
+        return j.get("sha"), content
+    return None, None
+
+def gh_put(path, content, expect_create=False, silent=False, sha=None):
+    body = {"message": f"autofarm [{PHONE_ID}] {path}",
+            "content": base64.b64encode(content.encode()).decode(),
+            "branch": GH_BRANCH}
+    if sha:
+        body["sha"] = sha
+    st, j = gh_api("PUT", path, body)
+    if st in (200, 201):
+        if path.startswith(FLEET_DIR + "/") and isinstance(j, dict):
+            _PUT_SHA_CACHE[path] = (j.get("content") or {}).get("sha")
+        return True
+    if expect_create and st == 422:
+        return False
+    if not silent:
+        log(f"⚠️ PUT {path}: HTTP {st}")
+    return False
+
+def gh_delete(path):
+    _PUT_SHA_CACHE.pop(path, None)
+    st, j = gh_api("GET", path)
+    if st == 404:
+        return True
+    if st == 0:
+        return False
+    sha = j.get("sha") if isinstance(j, dict) else None
+    if not sha:
+        return False
+    st2, _j = gh_api("DELETE", path, {"message": f"autofarm [{PHONE_ID}] del {path}",
+                                      "sha": sha, "branch": GH_BRANCH})
+    return st2 in (200, 204)
+
+def gh_list(path):
+    dir_path = (path or "").strip("/")
+    headers = {"Authorization": f"Bearer {GH_TOKEN}",
+               "Accept": "application/vnd.github+json", "User-Agent": PHONE_ID}
+    try:
+        r = _HTTP.get(f"https://api.github.com/repos/{GH_REPO}/git/trees/{GH_BRANCH}",
+                      headers=headers, timeout=25)
+        if r.status_code != 200:
+            return []
+        sha_dir = next((t["sha"] for t in r.json().get("tree", [])
+                        if t.get("path", "").strip("/") == dir_path and t.get("type") == "tree"), None)
+        if not sha_dir:
+            return []
+        r2 = _HTTP.get(f"https://api.github.com/repos/{GH_REPO}/git/trees/{sha_dir}",
+                       headers=headers, timeout=25)
+        if r2.status_code != 200:
+            return []
+        j2 = r2.json()
+        if j2.get("truncated"):
+            log(f"⚠️ gh_list({dir_path}): дерево ОБРЕЗАНО")
+        return [(t.get("path", ""), "") for t in j2.get("tree", []) if t.get("type") == "blob"]
+    except Exception:
+        return []
+
+# ============================================================
+# 💓 HEARTBEAT
+# ============================================================
+def _atomic_write_json(path, data):
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+def phone_stats():
+    if time.time() - _STATS_CACHE["ts"] < 120:
+        return _STATS_CACHE["v"]
+    bat = temp = ram = "?"
+    ok, out, _ = run_su("dumpsys battery | grep -E 'level:|temperature:'; "
+                        "grep MemAvailable /proc/meminfo", timeout=8)
+    if ok and out:
+        m = re.search(r'level:\s*(\d+)', out)
+        if m: bat = m.group(1) + "%"
+        m = re.search(r'temperature:\s*(\d+)', out)
+        if m: temp = f"{int(m.group(1)) / 10:.0f}C"
+        m = re.search(r'MemAvailable:\s*(\d+)', out)
+        if m: ram = f"{int(m.group(1)) // 1024}MB"
+    _STATS_CACHE["ts"] = time.time()
+    _STATS_CACHE["v"] = (bat, temp, ram)
+    return bat, temp, ram
+
+def fleet_status_put():
+    if not (GH_TOKEN and GH_REPO):
+        return
+    with _FLEET_LOCK:
+        bat, temp, ram = phone_stats()
+        lk = state.get("last_key_time", 0)
+        kage = (utc_ts() - lk) / 3600 if lk else -1
+        data = {"phone": PHONE_ID, "idx": PHONE_INDEX, "role": PHONE_ROLE,
+                "phase": CURRENT_PHASE[0], "ts": int(utc_ts()),
+                "key_age_h": round(kage, 1), "bat": bat, "temp": temp, "ram": ram}
+        path = f"{FLEET_DIR}/{PHONE_ID}.json"
+        payload = json.dumps(data)
+        sha = _PUT_SHA_CACHE.get(path)
+        if sha is None:
+            sha, _old = gh_get(path)
+        if not gh_put(path, payload, silent=True, sha=sha):
+            _PUT_SHA_CACHE.pop(path, None)
+            sha, _old = gh_get(path)
+            gh_put(path, payload, silent=True, sha=sha)
+
+def _heartbeat_loop():
+    _off = ((PHONE_INDEX % 60) * (HEARTBEAT_PERIOD // 60)
+            + (sum(ord(c) for c in PHONE_ID) % (HEARTBEAT_PERIOD // 60))) % HEARTBEAT_PERIOD
+    time.sleep(_off)
+    while True:
+        try:
+            measure_clock_offset()
+            fleet_status_put()
+        except Exception as e:
+            logv(f"heartbeat: {e}")
+        time.sleep(HEARTBEAT_PERIOD)
+
+def heartbeat_start(with_duty=True):
+    global _HB_STARTED
+    if _HB_STARTED:
+        return
+    _HB_STARTED = True
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+    if MONITOR_DUTY_ENABLED and with_duty:
+        threading.Thread(target=monitor_duty_loop, daemon=True).start()
+
+# ============================================================
+# ☁️ ПУЛ (pool = склад, claim = бронь)
+# ============================================================
+def _cookie_hash(c):
+    return hashlib.sha1(c.encode()).hexdigest()[:12]
+
+def pool_reap_claims():
+    now = utc_ts()
+    for name, _ in gh_list("claims"):
+        if not name.endswith(".json"):
+            continue
+        h = name[:-5]
+        _s, content = gh_get(f"claims/{h}.json")
+        try:
+            meta = json.loads(content) if content else {}
+        except Exception:
+            meta = {}
+        meta = meta or {}
+        if now - meta.get("ts", 0) < POOL_CLAIM_TTL:
+            continue
+        if gh_get(f"pool/{h}.txt")[0]:
+            gh_delete(f"claims/{h}.json")
+            continue
+        lost = meta.get("cookie", "") or ""
+        if lost and len(lost) > 40:
+            st, _u, _n = fetch_user_info_full(lost)
+            if st == "ok":
+                if gh_put(f"pool/{h}.txt", lost, expect_create=True, silent=True):
+                    log(f"♻️ Кука {h} восстановлена из протухшего claim")
+                    gh_delete(f"claims/{h}.json")
+            elif st == "dead":
+                logv(f"☠️ Кука {h} из claim мертва — списываю")
+                gh_delete(f"claims/{h}.json")
+            else:
+                logv(f"⏳ reap {h}: API недоступен — claim оставлен")
+        else:
+            gh_delete(f"claims/{h}.json")
+
+def pool_upload(cookie):
+    if not (POOL_ENABLED and GH_TOKEN and GH_REPO) or not cookie or len(cookie) < 40:
+        return False
+    h = _cookie_hash(cookie)
+    sha, _c = gh_get(f"pool/{h}.txt")
+    if sha:
+        logv(f"☁️ {h} уже в пуле (dup)")
+        return "dup"
+    ok = gh_put(f"pool/{h}.txt", cookie, expect_create=True, silent=True)
+    if not ok:
+        if gh_get(f"pool/{h}.txt")[0]:
+            return "dup"
+        log(f"⚠️ Не удалось загрузить {h} в пул")
+        return False
+    logv(f"☁️ Кука {h} → в пул")
+    return True
+
+def pool_count():
+    if not (GH_TOKEN and GH_REPO):
+        return -1
+    return len([x for x, _ in gh_list("pool") if x.endswith(".txt")])
+
+def pool_claim():
+    if not (GH_TOKEN and GH_REPO):
+        return None
+    try:
+        pool_reap_claims()
+    except Exception as e:
+        logv(f"⚠️ reap: {e}")
+    claimed = {name[:-5] for name, _ in gh_list("claims") if name.endswith(".json")}
+    now = utc_ts()
+    for name, _sha in gh_list("pool"):
+        h = name[:-4] if name.endswith(".txt") else name
+        claim_path = f"claims/{h}.json"
+        if h in claimed:
+            _s, content = gh_get(claim_path)
+            try:
+                meta = json.loads(content) if content else {}
+                ts = meta.get("ts", 0)
+            except Exception:
+                meta, ts = {}, 0
+            if now - ts < POOL_CLAIM_TTL:
+                continue
+            gh_delete(claim_path)
+            claimed.discard(h)
+        if not gh_put(claim_path, json.dumps({"phone": PHONE_ID, "ts": now}), expect_create=True):
+            continue
+        _s, cookie = gh_get(f"pool/{h}.txt")
+        if not (cookie and len(cookie.strip()) > 40):
+            gh_delete(claim_path)
+            continue
+        cookie = cookie.strip()
+        backed = False
+        _csha, _c2 = gh_get(claim_path)
+        if _csha:
+            backed = gh_put(claim_path, json.dumps({"phone": PHONE_ID, "ts": now,
+                                                    "cookie": cookie}), silent=True, sha=_csha)
+        if backed:
+            gh_delete(f"pool/{h}.txt")
+            log(f"🎯 Кука захвачена из пула ({h})")
+            return cookie
+        gh_delete(claim_path)
+        log(f"⚠️ Бэкап {h} в claim не удался — отпускаю")
+    return None
+
+def pool_consume_hash(h):
+    gh_delete(f"claims/{h}.json")
+
+def pool_consume(cookie):
+    pool_consume_hash(_cookie_hash(cookie))
+
+def pool_topup(need):
+    got = []
+    if need <= 0 or not (GH_TOKEN and GH_REPO):
+        return got
+    log(f"☁️ Пул: добираю {need} кук...")
+    while need > 0:
+        c = pool_claim()
+        if not c:
+            log("☁️ Пул пуст/недоступен")
+            break
+        st, uid, uname = fetch_user_info_full(c)
+        if st == "ok":
+            got.append(c); need -= 1
+            log(f"✅ Из пула: {uname} | осталось: {need}")
+        elif st == "dead":
+            logv("☠️ Кука из пула мёртвая — списываю")
+            pool_consume(c)
+        else:
+            log("⚠️ Проверка не удалась (сеть?) — возврат в пул")
+            if pool_upload(c) in (True, "dup"):
+                pool_consume(c)
+            else:
+                log("⚠️ Вернуть не удалось — claim оставлен, TTL вернёт кукy в пул")
+            break
+    return got
+
+# ============================================================
+# 🚀 РЕГИСТРАЦИЯ (идёт на MAIN — после реги main вайпается)
+# ============================================================
+def launch():
+    logv(f"🚀 Запуск {PKG_MAIN} для регu, жду {P_LAUNCH_FIRST}с")
+    run_su(f"monkey -p {PKG_MAIN} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1", timeout=10)
+    time.sleep(P_LAUNCH_FIRST)
+
+def wait_registration_screen(extra=15):
+    deadline = time.time() + extra
+    marks = ("sign up", "sign-up", "signup", "log in", "login", "sign in",
+             "войти", "регистрац", "создать", "birthday", "дата рожден")
+    while time.time() < deadline:
+        xml = ui_dump()
+        if xml:
+            if "EditText" in xml:
+                logv("✅ Экран регистрации готов")
+                return True
+            joined = " | ".join(html_mod.unescape(t).lower()
+                                for t in re.findall(r'text="([^"]+)"', xml))
+            if any(k in joined for k in marks):
+                logv("✅ Экран регистрации готов")
+                return True
+        time.sleep(2)
+    logv("⚠️ Welcome-экран не дождался — по координатам")
+    return False
+
+def type_password_batch(password):
+    cmds = []
+    for ch in password:
+        if ch in KEYCODE_LOWER:
+            cmds.append(f"input keyevent {KEYCODE_LOWER[ch]}")
+        elif ch in KEYCODE_DIGIT:
+            cmds.append(f"input keyevent {KEYCODE_DIGIT[ch]}")
+        elif ch.isupper():
+            code = KEYCODE_LOWER.get(ch.lower())
+            if code:
+                cmds.append(f"input keycombination 59 {code}")
+        else:
+            cmds.append(f"input text '{ch}'")
+        cmds.append(f"sleep {P_KEY_CHAR}")
+    run_su("; ".join(cmds), timeout=60)
+
+def get_field_length():
+    xml = ui_dump()
+    if not xml:
+        return -1
+    first = -1
+    for m in re.finditer(r'<node[^>]*/?>', xml):
+        attrs = dict(re.findall(r'([\w-]+)="([^"]*)"', m.group(0)))
+        if "EditText" not in attrs.get("class", ""):
+            continue
+        ln = len(html_mod.unescape(attrs.get("text", "")))
+        if attrs.get("focused") == "true" or attrs.get("password") == "true":
+            return ln
+        if first < 0:
+            first = ln
+    return first
+
+def password_field_visible():
+    xml = ui_dump()
+    if not xml:
+        return False
+    return any("EditText" in dict(re.findall(r'([\w-]+)="([^"]*)"', m.group(0))).get("class", "")
+               for m in re.finditer(r'<node[^>]*/?>', xml))
+
+def wait_password_field(timeout=P_FIELD_WAIT, reserve_tap=TAP_X):
+    deadline = time.time() + timeout
+    poked = False
+    while time.time() < deadline:
+        if password_field_visible():
+            logv("✅ Поле пароля открыто")
+            return True
+        if not poked and (deadline - time.time()) <= 6:
+            tap(*reserve_tap)
+            poked = True
+        time.sleep(1)
+    return False
+
+def type_password_reliable(password):
+    type_text(password, timeout=30)
+    time.sleep(P_PASSWORD_SETTLE)
+    for _ in range(3):
+        got = get_field_length()
+        if got == -1:
+            return True
+        if got >= len(password):
+            return True
+        type_text(password[got:], timeout=20)
+        time.sleep(2)
+    got = get_field_length()
+    if got != -1 and 0 < got < len(password):
+        logv("⚠️ Пароль вводится плохо — batch-режим")
+        select_all_delete()
+        type_password_batch(password)
+        time.sleep(3)
+    return True
+
+def hide_keyboard():
+    tap(*TAP_HIDE_KB)
+    time.sleep(P_HIDE_KB)
+
+# ============================================================
+# 🍪 КУКИ: чтение / запись
+# ============================================================
+def pkg_uid(pkg):
+    ok, out, _ = run_su(f"stat -c %u /data/data/{pkg}")
+    return out.strip() if ok and out.strip() else None
+
+def fix_ownership(pkg, path):
+    uid = pkg_uid(pkg)
+    if uid: run_su(f"chown -R {uid}:{uid} '{path}'")
+    run_su(f"chmod -R u+rwX '{path}'")
+
+def copy_db_to_work(db):
+    run_su(f"rm -f '{WORK_DB}' '{WORK_DB}-wal' '{WORK_DB}-journal' '{WORK_DB}-shm'")
+    run_su(f"cp '{db}' '{WORK_DB}' 2>/dev/null")
+    run_su(f"cp '{db}-wal' '{WORK_DB}-wal' 2>/dev/null")
+    run_su(f"cp '{db}-shm' '{WORK_DB}-shm' 2>/dev/null")
+    run_su(f"cp '{db}-journal' '{WORK_DB}-journal' 2>/dev/null")
+    run_su(f"chmod 666 '{WORK_DB}' '{WORK_DB}-wal' '{WORK_DB}-shm' '{WORK_DB}-journal' 2>/dev/null")
+
+def clean_work_db():
+    run_su(f"rm -f '{WORK_DB}' '{WORK_DB}-wal' '{WORK_DB}-journal' '{WORK_DB}-shm'")
+
+def get_table_cols():
+    try:
+        con = sqlite3.connect(WORK_DB)
+        has = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cookies'").fetchone()
+        if not has:
+            con.close(); return []
+        cols = [r[1] for r in con.execute("PRAGMA table_info(cookies)").fetchall()]
+        con.close(); return cols
+    except Exception:
+        return []
+
+def cookie_db_candidates(pkg):
+    base = f"/data/data/{pkg}/app_webview"
+    return [f"{base}/Default/Cookies",
+            f"{base}/Default/Network/Cookies",
+            f"{base}/Cookies"]
+
+def _read_roblosecurity(db):
+    if not run_su(f"test -f '{db}'")[0]:
+        return None
+    copy_db_to_work(db)
+    con = None
+    try:
+        con = sqlite3.connect(WORK_DB)
+        has = con.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                          "AND name='cookies'").fetchone()
+        if not has:
+            return None
+        rows = con.execute("SELECT value FROM cookies WHERE name='.ROBLOSECURITY' "
+                           "AND host_key LIKE '%roblox.com' ORDER BY expires_utc DESC").fetchall()
+        for (val,) in rows:
+            if val and len(val) > 40:
+                return val.strip()
+    except Exception:
+        pass
+    finally:
+        if con:
+            try: con.close()
+            except Exception: pass
+        clean_work_db()
+    return None
+
+def extract_cookie(pkg=PKG_MAIN):
+    deadline = time.time() + P_COOKIE_WAIT
+    while time.time() < deadline:
+        for db in cookie_db_candidates(pkg):
+            v = _read_roblosecurity(db)
+            if v:
+                return v
+        time.sleep(3)
+    return None
+
+def fetch_user_info_full(cookie):
+    try:
+        r = _HTTP.get("https://users.roblox.com/v1/users/authenticated",
+                      headers={"Cookie": f".ROBLOSECURITY={cookie}", "User-Agent": "Roblox/Win32"},
+                      timeout=15)
+        if r.status_code == 200:
+            d = r.json(); return "ok", d.get("id"), d.get("name")
+        if r.status_code == 401:
+            return "dead", None, None
+        return "error", None, None
+    except Exception:
+        return "error", None, None
+
+def save_cookie(cookie, nick, password):
+    with open(COOKIES_F, "a") as f: f.write(cookie + "\n")
+    with open(ACCOUNTS_F, "a") as f: f.write(f"{nick}:{password}\n")
+
+def save_account_pass(nick, password):
+    try:
+        with open(ACCOUNTS_F, "a") as f: f.write(f"{nick}:{password}\n")
+    except Exception:
+        pass
+
+def load_cookies_file():
+    if not os.path.exists(COOKIES_F):
+        return []
+    with open(COOKIES_F) as f:
+        return [l.strip() for l in f if l.strip() and len(l.strip()) > 40]
+
+def has_session(pkg):
+    for db in cookie_db_candidates(pkg):
+        if not run_su(f"test -f '{db}'")[0]:
+            continue
+        copy_db_to_work(db)
+        if not get_table_cols():
+            clean_work_db(); continue
+        con = None
+        try:
+            con = sqlite3.connect(WORK_DB)
+            rows = con.execute(
+                "SELECT length(value) FROM cookies WHERE name='.ROBLOSECURITY'").fetchall()
+            if any(r[0] and r[0] > 40 for r in rows):
+                return True
+        except Exception:
+            pass
+        finally:
+            if con:
+                try: con.close()
+                except Exception: pass
+            clean_work_db()
+    return False
+
+def roblox_pkgs():
+    now = time.time()
+    if _PKGS_CACHE["pkgs"] and now - _PKGS_CACHE["ts"] < 60:
+        return _PKGS_CACHE["pkgs"]
+    ok, out, _ = run_su("pm list packages com.roblox", timeout=10)
+    if ok:
+        pkgs = sorted(l.split(":", 1)[1].strip() for l in out.splitlines() if l.startswith("package:"))
+        if pkgs:
+            _PKGS_CACHE["ts"] = now
+            _PKGS_CACHE["pkgs"] = pkgs
+            return pkgs
+    return _PKGS_CACHE["pkgs"] if _PKGS_CACHE["pkgs"] else []
+
+def _farm_pkgs():
+    """🚜 v6.5: ТОЛЬКО клоны-фармеры. MAIN НЕ ФАРМИТ — он инструмент
+    байпаса и реги. Максимум FARMERS_LIMIT пакетов."""
+    return [p for p in roblox_pkgs() if p != PKG_MAIN][:FARMERS_LIMIT]
+
+def count_sessions():
+    """🔢 v6.5: сессии ТОЛЬКО у клонов-фармеров (main не считается)."""
+    return sum(1 for pkg in _farm_pkgs() if has_session(pkg))
+
+# ============================================================
+# 🧹 ВАЙП / ЧИСТКА / АРХИВ
+# ============================================================
+def archive_and_clear_cookies(reason="сессия завершена"):
+    if not os.path.exists(COOKIES_F):
+        return 0
+    raw = load_cookies_file()
+    if not raw:
+        return 0
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    arch = os.path.join(ARCHIVE_DIR, f"cookies_used_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+    try:
+        with open(arch + ".tmp", "w") as f:
+            for c in raw:
+                f.write(c + "\n")
+        os.replace(arch + ".tmp", arch)
+    except Exception as e:
+        log(f"🧹 ⚠️ Архивация НЕ удалась ({e}) — кукисы СОХРАНЕНЫ на месте")
+        return 0
+    try:
+        with open(COOKIES_F, "w") as f:
+            pass
+        log(f"🧹 ВАЙП ({reason}): {len(raw)} кук → архив")
+    except Exception as e:
+        log(f"🧹 ⚠️ Не очистил cookies.txt: {e}")
+    return len(raw)
+
+def archive_cookie_list(cookies, reason="инъекция"):
+    if not cookies:
+        return 0
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    path = os.path.join(ARCHIVE_DIR, f"cookies_used_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+    try:
+        with open(path, "a") as f:
+            for c in cookies:
+                f.write(c + "\n")
+    except Exception as e:
+        log(f"🧹 ⚠️ Архивация {len(cookies)} кук не удалась: {e}")
+        return 0
+    drop = {_cookie_hash(c) for c in cookies}
+    try:
+        remaining = [c for c in load_cookies_file() if _cookie_hash(c) not in drop]
+        with open(COOKIES_F + ".tmp", "w") as f:
+            for c in remaining:
+                f.write(c + "\n")
+        os.replace(COOKIES_F + ".tmp", COOKIES_F)
+    except Exception as e:
+        log(f"🧹 ⚠️ Не обновил cookies.txt: {e}")
+    logv(f"🧹 ({reason}): {len(cookies)} кук → архив")
+    return len(cookies)
+
+def clean_dead_cookies():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    if not os.path.exists(COOKIES_F):
+        return 0, 0
+    raw = load_cookies_file()
+    unique = list(dict.fromkeys(raw))
+    dupes = len(raw) - len(unique)
+    live, dead = [], 0
+    for c in unique:
+        st, uid, uname = fetch_user_info_full(c)
+        if st == "ok":
+            live.append(c)
+        elif st == "dead":
+            dead += 1
+        else:
+            live.append(c)
+    if dead or dupes:
+        with open(COOKIES_F + ".tmp", "w") as f:
+            for c in live:
+                f.write(c + "\n")
+        os.replace(COOKIES_F + ".tmp", COOKIES_F)
+    log(f"🧹 ЧИСТКА: живых {len(live)}, мёртвых {dead}, дублей {dupes}")
+    return len(live), dead + dupes
+
+def _wipe_one_pkg(pkg):
+    run_su(f"am force-stop {pkg}", timeout=5)
+    time.sleep(P_KILL_SETTLE)
+    run_su(f"rm -rf '/data/data/{pkg}/app_webview'", timeout=20)
+    for p in [f"/data/data/{pkg}/cache/webview", f"/data/data/{pkg}/cache/WebView"]:
+        if run_su(f"test -e '{p}'")[0]:
+            run_su(f"rm -rf '{p}'", timeout=15)
+    ok, out, _ = run_su(f"grep -l -i -E '{SESSION_GREP}' /data/data/{pkg}/shared_prefs/*.xml 2>/dev/null")
+    if ok and out:
+        for f in out.splitlines():
+            run_su(f"rm -f '{f.strip()}'", timeout=5)
+    uid = pkg_uid(pkg)
+    if uid:
+        run_su(f"chown -R {uid}:{uid} /data/data/{pkg}/shared_prefs", timeout=5)
+
+def _hard_reset_main(context=""):
+    for i in range(3):
+        _wipe_one_pkg(PKG_MAIN)
+        if not has_session(PKG_MAIN):
+            if i > 0:
+                logv(f"✅ pm clear помог ({context})")
+            return True
+        log(f"⚠️ Сессия пережила вайп ({context}) — эскалация: pm clear")
+        run_su(f"pm clear {PKG_MAIN}", timeout=30)
+        time.sleep(3)
+    if has_session(PKG_MAIN):
+        log(f"🆘 {PKG_MAIN} НЕ ВЫШЕЛ из акка ({context}) — разберись вручную!")
+        return False
+    return True
+
+def soft_logout_all():
+    log("🚪 Мягкий выход из всех пакетов...")
+    windows_clear()
+    for pkg in roblox_pkgs():
+        _wipe_one_pkg(pkg)
+    time.sleep(SOFT_LOGOUT_SETTLE)
+    log("✅ Все разлогинены")
+
+# ============================================================
+# 💉 ИНЪЕКЦИЯ КУК (ТОЛЬКО В КЛОНЫ!)
+# ============================================================
+def webview_version():
+    for wv in ("com.google.android.webview", "com.android.webview",
+               "com.google.android.trichromelibrary"):
+        ok, out, _ = run_su(f"dumpsys package {wv} | grep -m1 versionName")
+        if ok and out:
+            m = re.search(r'versionName=(\d+)', out)
+            if m:
+                return int(m.group(1))
+    return None
+
+def _win_to_chrome_time(days=365):
+    return int((time.time() + days * 86400) * 1_000_000) + 11644473600 * 1_000_000
+
+def _native_create_one(pkg, db):
+    for _attempt in range(2):
+        run_su(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1", timeout=10)
+        time.sleep(8)
+        run_su(f"am force-stop {pkg}", timeout=5)
+        time.sleep(1)
+        if run_su(f"test -f '{db}'")[0]:
+            return True
+    return False
+
+def _native_create_any(pkg):
+    for _attempt in range(2):
+        run_su(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1", timeout=10)
+        time.sleep(8)
+        run_su(f"am force-stop {pkg}", timeout=5)
+        time.sleep(1)
+        for db in cookie_db_candidates(pkg):
+            if run_su(f"test -f '{db}'")[0]:
+                return db
+    return None
+
+def _inject_cookie_into_db(pkg, db, cookie, wv):
+    need_recreate = False
+    if not run_su(f"test -f '{db}'")[0]:
+        need_recreate = True
+    else:
+        copy_db_to_work(db)
+        cols = get_table_cols()
+        clean_work_db()
+        if not cols:
+            need_recreate = True
+        else:
+            has_new = "source_type" in cols
+            has_old = "is_same_party" in cols
+            if wv and wv < 115:
+                need_recreate = not (has_old and not has_new)
+            else:
+                need_recreate = not has_new
+    if need_recreate:
+        if not _native_create_one(pkg, db):
+            target = SCHEMA_V94 if (wv and wv < 115) else SCHEMA_V150
+            run_su(f"mkdir -p '{os.path.dirname(db)}'")
+            copy_db_to_work(db)
+            con = None
+            try:
+                con = sqlite3.connect(WORK_DB)
+                con.execute(target)
+                con.commit()
+                run_su(f"cp '{WORK_DB}' '{db}'")
+                run_su(f"rm -f '{db}-wal' '{db}-shm' '{db}-journal'")
+                clean_work_db()
+            except Exception as e:
+                log(f"❌ Схема {db}: {e}"); clean_work_db(); return False
+            finally:
+                if con:
+                    try: con.close()
+                    except Exception: pass
+    copy_db_to_work(db)
+    con = None
+    try:
+        con = sqlite3.connect(WORK_DB)
+        cur = con.cursor()
+        cols_info = cur.execute("PRAGMA table_info(cookies)").fetchall()
+        if not cols_info:
+            return False
+        now_us = _win_to_chrome_time(0)
+        defaults = {
+            "creation_utc": now_us, "top_frame_site_key": "", "host_key": ".roblox.com",
+            "name": ".ROBLOSECURITY", "value": cookie, "encrypted_value": b"",
+            "path": "/", "expires_utc": now_us + 946080000000000, "is_secure": 1,
+            "is_httponly": 1, "last_access_utc": now_us, "has_expires": 1,
+            "is_persistent": 1, "priority": 1, "samesite": -1, "source_scheme": 2,
+            "source_port": 443, "is_same_party": 0, "last_update_utc": now_us,
+            "source_type": 3, "has_cross_site_ancestor": 1,
+        }
+        names, vals = [], []
+        for _cid, cname, ctype, notnull, dflt, pk in cols_info:
+            if cname in defaults:
+                names.append(cname); vals.append(defaults[cname])
+            elif notnull and dflt is None and pk == 0:
+                if ctype.upper().startswith("INT"): v = 0
+                elif ctype.upper().startswith("BLOB"): v = b""
+                else: v = ""
+                names.append(cname); vals.append(v)
+        cur.execute("DELETE FROM cookies WHERE name='.ROBLOSECURITY'")
+        cur.execute(f"INSERT INTO cookies ({','.join(names)}) VALUES ({','.join('?' * len(names))})", vals)
+        con.commit()
+        run_su(f"cp '{WORK_DB}' '{db}'")
+        run_su(f"rm -f '{db}-wal' '{db}-shm' '{db}-journal'")
+        clean_work_db()
+        return True
+    except Exception as e:
+        log(f"❌ Инъекция {db}: {e}"); clean_work_db(); return False
+    finally:
+        if con:
+            try: con.close()
+            except Exception: pass
+
+def inject_cookie_db(pkg, cookie):
+    run_su(f"am force-stop {pkg}", timeout=5)
+    time.sleep(P_KILL_SETTLE)
+    run_su(f"mkdir -p /data/data/{pkg}/app_webview/Default/Network")
+    wv = webview_version()
+    d1 = f"/data/data/{pkg}/app_webview/Default/Cookies"
+    d2 = f"/data/data/{pkg}/app_webview/Default/Network/Cookies"
+    have1 = run_su(f"test -f '{d1}'")[0]
+    have2 = run_su(f"test -f '{d2}'")[0]
+    if have1:
+        logv("📍 Primary cookie DB: Default/Cookies")
+    elif have2:
+        logv("📍 Primary cookie DB: Default/Network/Cookies")
+    else:
+        _native_create_any(pkg)
+    ok1 = _inject_cookie_into_db(pkg, d1, cookie, wv)
+    ok2 = _inject_cookie_into_db(pkg, d2, cookie, wv)
+    fix_ownership(pkg, f"/data/data/{pkg}/app_webview")
+    return ok1 and ok2
+
+def inject_prefs_identity(pkg, username, userid):
+    prefs = f"/data/data/{pkg}/shared_prefs/prefs.xml"
+    ok, content, _ = run_su(f"cat '{prefs}'")
+    if not ok or not content:
+        content = "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map></map>"
+    new = content
+    for tag in ("username", "displayName"):
+        if re.search(rf'<string\s+name="{tag}"\s*>', new):
+            new = re.sub(rf'(<string\s+name="{tag}"\s*>)[^<]*(</string>)',
+                         lambda m: m.group(1) + username + m.group(2), new)
+        else:
+            new = new.replace("</map>", f'<string name="{tag}">{username}</string></map>')
+    if re.search(r'<long\s+name="userid_long"\s+value="', new):
+        new = re.sub(r'(<long\s+name="userid_long"\s+value=")[^"]*("\s*/>)',
+                     lambda m: m.group(1) + str(userid) + m.group(2), new)
+    else:
+        new = new.replace("</map>", f'<long name="userid_long" value="{userid}" /></map>')
+    if new != content:
+        escaped = new.replace("'", "'\\''")
+        run_su(f"printf '%s' '{escaped}' > '{prefs}'")
+        fix_ownership(pkg, f"/data/data/{pkg}/shared_prefs")
+
+def inject_pkg(pkg, cookie):
+    st, uid, uname = fetch_user_info_full(cookie)
+    if st == "error":
+        time.sleep(5)
+        st, uid, uname = fetch_user_info_full(cookie)
+    if st == "dead":
+        log("☠️ Кука мёртвая (401)")
+        return None
+    if st != "ok":
+        log("⚠️ API недоступен — инъекция пропущена, кукa не тронута")
+        return None
+    if not inject_cookie_db(pkg, cookie): return None
+    inject_prefs_identity(pkg, uname, uid)
+    if has_session(pkg):
+        logv(f"✅ {pkg} готов как {uname}")
+        return uname
+    log("⚠️ Запись не подтвердилась — кукa израсходована")
+    return "unverified"
+
+# ============================================================
+# 🎲 ГЕНЕРАТОРЫ / RATE-LIMIT
+# ============================================================
+def gen_nick():
+    letters = "".join(random.choice(string.ascii_lowercase) for _ in range(random.randint(8, 11)))
+    return letters + str(random.randint(100, 9999))
+
+def gen_pass(_nick):
+    while True:
+        p = "".join(random.choice(string.ascii_lowercase + string.ascii_uppercase + string.digits)
+                    for _ in range(14))
+        if any(c.isupper() for c in p) and any(c.islower() for c in p) and any(c.isdigit() for c in p):
+            return p
+
+RATE_LIMIT_MARKERS = (
+    "too many attempts", "too many tries", "слишком много попыток",
+    "слишком много", "try again later", "попробуйте позже",
+    "too many requests", "rate limit", "превышено",
+)
+
+def check_rate_limit():
+    xml = ui_dump()
+    if not xml:
+        return False
+    texts = []
+    for m in re.finditer(r'<node[^>]*/?>', xml):
+        attrs = dict(re.findall(r'([\w-]+)="([^"]*)"', m.group(0)))
+        t = html_mod.unescape(attrs.get("text", ""))
+        if t: texts.append(t)
+    txt = " | ".join(texts).lower()
+    return any(marker in txt for marker in RATE_LIMIT_MARKERS)
+
+# ============================================================
+# 🤖 ПОПЫТКА / ЦИКЛ РЕГИ (рега на MAIN, куки — в файл)
+# ============================================================
+def registration_attempt(attempt_num):
+    nick = gen_nick()
+    password = gen_pass(nick)
+    logv(f"— ПОПЫТКА {attempt_num} | {nick}:{password}")
+
+    if not _hard_reset_main(f"перед попыткой {attempt_num}"):
+        raise RuntimeError("wipe PKG_MAIN failed — проверить su!")
+    launch()
+    wait_registration_screen()
+    tap(*TAP_CREATE);  time.sleep(P_STEP)
+
+    year_cmds = "; ".join(
+        f"input tap {TAP_YEAR[0]} {TAP_YEAR[1]}; sleep 0.9" for _ in range(YEAR_TAPS))
+    run_su(year_cmds, timeout=YEAR_TAPS * 2 + 10)
+
+    tap(*TAP_CONFIRM); time.sleep(P_STEP)
+    tap(*TAP_USERNAME); time.sleep(1.5)
+    type_text(nick, timeout=20)
+    time.sleep(P_AFTER_TYPE)
+    hide_keyboard()
+    tap(*TAP_CONTINUE); time.sleep(P_CONTINUE)
+
+    if check_rate_limit():
+        log("🚫 RATE-LIMIT после Продолжить!")
+        return None, True
+
+    time.sleep(P_BEFORE_X)
+    tap(*TAP_X)
+
+    if check_rate_limit():
+        log("🚫 RATE-LIMIT после крестика!")
+        return None, True
+
+    if not wait_password_field(P_FIELD_WAIT):
+        logv("⚠️ Поле пароля не появилось — ввожу вслепую")
+
+    type_password_reliable(password)
+    hide_keyboard()
+    time.sleep(P_REDRAW)
+    tap(*TAP_DONE); time.sleep(P_STEP)
+
+    if check_rate_limit():
+        log("🚫 RATE-LIMIT после Готово!")
+        return None, True
+
+    cookie = extract_cookie()
+    if not cookie:
+        log("❌ Кука не появилась")
+        if has_session(PKG_MAIN):
+            log(f"⚠️ Регистрация похоже УСПЕШНА, но кукy не вытащил — акк {nick} пропадёт!")
+        if check_rate_limit():
+            return None, True
+        return None, False
+
+    st, uid, uname = fetch_user_info_full(cookie)
+    if st == "dead":
+        log("❌ Кука не прошла API (401)")
+        return None, False
+    if st == "error":
+        log("⚠️ API недоступен — сохраняю кукy с локальным ником")
+        return {"cookie": cookie, "nick": nick, "pass": password}, False
+
+    log(f"✅ Акк готов: {uname}")
+    return {"cookie": cookie, "nick": uname, "pass": password}, False
+
+def _today_str():
+    return utc_now().strftime("%Y-%m-%d")
+
+def _persist_excess(result):
+    try:
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        p = os.path.join(ARCHIVE_DIR, f"excess_pending_{_today_str()}.txt")
+        with open(p, "a") as f:
+            f.write(result["cookie"] + "\n")
+        save_account_pass(result["nick"], result["pass"])
+    except Exception:
+        pass
+
+def collect_cookies(target_total):
+    pool_on = bool(POOL_ENABLED and GH_TOKEN and GH_REPO)
+    kept, excess_pending = [], []
+    pooled = 0
+    total_attempts = MAX_ROUNDS * REG_ATTEMPTS
+    log(f"🎯 Рега: {total_attempts} попыток | себе {target_total} | излишек → {'ПУЛ' if pool_on else 'архив'}")
+    done = 0
+    out_of_time = False
+    for round_num in range(1, MAX_ROUNDS + 1):
+        check_stop()
+        log(f"🔁 Раунд {round_num}/{MAX_ROUNDS} | сделано {done} | себе {len(kept)}/{target_total}")
+        rate_limited = False
+        consec_errors = 0
+        for attempt in range(1, REG_ATTEMPTS + 1):
+            check_stop()
+            if not pool_on and len(kept) >= target_total:
+                break
+            if harvest_minutes_away() < 45:
+                log(f"⏰ До окна урожая {harvest_minutes_away():.0f} мин — рега заканчивается досрочно")
+                out_of_time = True
+                break
+            done += 1
+            raised_exc = False
+            try:
+                result, rl = registration_attempt(done)
+            except Exception:
+                logv("💥 Попытка упала с исключением")
+                traceback.print_exc()
+                result, rl = None, False
+                consec_errors += 1
+                raised_exc = True
+            else:
+                consec_errors = 0
+            finally:
+                kill_main_only()
+                if not _hard_reset_main(f"после попытки {done}"):
+                    log("⚠️ Ресет после попытки не подтвердился")
+            if raised_exc and consec_errors >= 3:
+                raise RuntimeError("3 подряд упавших попытки — системная проблема")
+            if rl:
+                rate_limited = True
+                break
+            if result:
+                if len(kept) < target_total:
+                    kept.append(result)
+                    save_cookie(result["cookie"], result["nick"], result["pass"])
+                else:
+                    logv(f"☁️ Себе хватает → {result['nick']} В ПУЛ")
+                    if pool_upload(result["cookie"]) in (True, "dup"):
+                        pooled += 1
+                    else:
+                        excess_pending.append(result)
+                        _persist_excess(result)
+            else:
+                logv(f"❌ Попытка {done}/{total_attempts} провалилась")
+        if out_of_time or (not pool_on and len(kept) >= target_total):
+            break
+        if round_num < MAX_ROUNDS:
+            pause_min = RATE_LIMIT_PAUSE // 60 if rate_limited else ROUND_PAUSE_MIN
+            log(f"⏸️ Пауза {pause_min} мин...")
+            sleep_stop(pause_min * 60)
+    if excess_pending:
+        logv(f"☁️ Дозагрузка {len(excess_pending)} кук в пул (ретрай)...")
+        for r in excess_pending:
+            if pool_upload(r["cookie"]) in (True, "dup"):
+                pooled += 1
+    log(f"🏁 Рега: попыток {done}/{total_attempts} | себе {len(kept)} | в пул {pooled}")
+    ui_cache_clear()
+    return kept
+
+# ============================================================
+# 💉 ВХОД ПО КУКАМ — ТОЛЬКО В КЛОНЫ
+# ============================================================
+def do_injection(cookies, only_empty=False):
+    """Куки вписываются ТОЛЬКО в клоны-фармеры. main не трогаем."""
+    if not cookies:
+        log("☠️ Входить нечем")
+        return 0, []
+    pkgs = _farm_pkgs()
+    if only_empty:
+        pkgs = [p for p in pkgs if not has_session(p)]
+    log(f"💉 Вход по кукам в КЛОНЫ: пакетов {len(pkgs)} | кук {len(cookies)}")
+    ok_count = 0
+    consumed = []
+    recycle = []
+    pairs = list(zip(pkgs, cookies))
+    leftover = cookies[len(pairs):]
+    for pkg, c in pairs:
+        res = inject_pkg(pkg, c)
+        if res == "unverified":
+            consumed.append(c)
+            log(f"⚠️ Не подтверждено (кука израсходована): {pkg}")
+        elif res:
+            ok_count += 1
+            consumed.append(c)
+            log(f"🎉 ЗАШЛО: {pkg} → {res}")
+        else:
+            st2, _u, _n = fetch_user_info_full(c)
+            if st2 == "dead":
+                consumed.append(c)
+                log(f"☠️ Не зашло (кука мертва): {pkg}")
+            else:
+                recycle.append(c)
+                log(f"⚠️ Не зашло (кука не тронута): {pkg}")
+    for c in leftover:
+        st2, _u, _n = fetch_user_info_full(c)
+        if st2 == "dead":
+            consumed.append(c)
+        else:
+            recycle.append(c)
+    if len(cookies) < len(pkgs):
+        empty = pkgs[len(cookies):]
+        log(f"⚠️ Кук не хватило — без акка остались: {', '.join(empty) if empty else '—'}")
+    archive_cookie_list(consumed, "инъекция завершена")
+    return ok_count, recycle
+
+def _drop_cookies_from_file(cookies):
+    if not cookies or not os.path.exists(COOKIES_F):
+        return
+    drop = {_cookie_hash(c) for c in cookies}
+    try:
+        remaining = [c for c in load_cookies_file() if _cookie_hash(c) not in drop]
+        with open(COOKIES_F + ".tmp", "w") as f:
+            for c in remaining:
+                f.write(c + "\n")
+        os.replace(COOKIES_F + ".tmp", COOKIES_F)
+    except Exception as e:
+        log(f"🧹 ⚠️ Не убрал куки из cookies.txt: {e}")
+
+def _recycle_cookies(recycle, claimed):
+    rec_h = {_cookie_hash(c) for c in recycle}
+    claimed_h = {_cookie_hash(c) for c in claimed}
+    ok_h = set()
+    for c in recycle:
+        h = _cookie_hash(c)
+        if pool_upload(c) in (True, "dup"):
+            ok_h.add(h)
+            _drop_cookies_from_file([c])
+        else:
+            log(f"⚠️ Кукy {h} не удалось вернуть в пул")
+    for h in claimed_h:
+        if h in rec_h and h not in ok_h:
+            logv(f"♻️ Claim {h} оставлен — TTL вернёт кукy в пул")
+            continue
+        pool_consume_hash(h)
+
+def _drain_local_to_pool():
+    raw = load_cookies_file()
+    if not raw:
+        return
+    uniq = list(dict.fromkeys(raw))
+    ok = 0
+    for c in uniq:
+        if pool_upload(c) in (True, "dup"):
+            ok += 1
+            _drop_cookies_from_file([c])
+    log(f"☁️ Дренаж cookies.txt: {ok}/{len(uniq)} → в пул")
+
+def phase_registration_and_login(target):
+    set_phase("REG")
+    set_portrait()
+    _drain_local_to_pool()
+    archive_and_clear_cookies("перед стартом новой сессии")
+    soft_logout_all()
+    collect_cookies(target)
+
+    check_stop()
+    set_phase("CLEANUP")
+    clean_dead_cookies()
+
+    check_stop()
+    login_cookies = list(dict.fromkeys(load_cookies_file()))
+    claimed = []
+    if POOL_ENABLED and GH_TOKEN and GH_REPO:
+        need = target - len(login_cookies)
+        if need > 0:
+            set_phase("POOL")
+            claimed = pool_topup(need)
+            login_cookies = login_cookies + claimed
+
+    check_stop()
+    set_phase("INJECT")
+    soft_logout_all()
+    _okc, recycle = do_injection(login_cookies)          # ← клоны only
+    _recycle_cookies(recycle, claimed)
+    state["last_reg_date"] = _today_str()
+    save_state()
+    ui_cache_clear()
+
+# ============================================================
+# 🛑 ПРОЦЕССЫ / LUA
+# ============================================================
+def kill_all_roblox():
+    windows_clear()
+    ok, out, _ = run_su("pm list packages com.roblox", timeout=10)
+    killed = 0
+    if ok:
+        for line in out.splitlines():
+            if line.startswith("package:"):
+                run_su(f"am force-stop {line.split(':', 1)[1].strip()}", timeout=5)
+                killed += 1
+    run_su("am force-stop com.android.chrome", timeout=5)
+    run_su("am force-stop com.android.browser", timeout=5)
+    logv(f"🛑 kill roblox ×{killed}")
+    time.sleep(P_FORCE_KILL_SETTLE)
+
+def kill_main_only():
+    windows_untrack(PKG_MAIN)
+    run_su(f"am force-stop {PKG_MAIN}", timeout=5)
+    run_su("am force-stop com.android.chrome", timeout=5)
+    time.sleep(P_KILL_SETTLE)
+
+def wake_screen():
+    ok, out, _ = run_su("dumpsys power | grep 'mWakefulness='", timeout=5)
+    if ok and "mWakefulness=Awake" in out:
+        return
+    logv("🌅 Экран выключен — буджу")
+    run_su("input keyevent 224", timeout=5)
+    time.sleep(1)
+    run_su("input keyevent 82", timeout=5)
+    time.sleep(1)
+
+def launch_delta():
+    """🔓 Запуск MAIN для байпаса (единственная роль main кроме реги)."""
+    deep_link = f"'roblox://experiences/start?placeId={PLACE_ID}'"
+    run_su(f"am start -a android.intent.action.VIEW -d {deep_link} {PKG_MAIN}", timeout=10)
+
+def _safe_code(code):
+    return re.sub(r'[^A-Za-z0-9_\-]', '', str(code or ""))
+
+def launch_private(pkg, code):
+    code = _safe_code(code)
+    if not code:
+        return
+    share = f"'https://www.roblox.com/share?code={code}&type=Server'"
+    ok, _, _ = run_su(f"am start -a android.intent.action.VIEW -d {share} {pkg}", timeout=5)
+    if not ok:
+        run_su(f"am start -a android.intent.action.VIEW -d "
+               f"'roblox://experiences/start?privateServerLinkCode={code}' {pkg}", timeout=5)
+
+def launch_roblox_light_farm():
+    """🚜 v6.5: запускает ТОЛЬКО КЛОНЫ. main НЕ фармит."""
+    launched = 0
+    for pkg in _farm_pkgs():
+        if launched >= FARMERS_LIMIT:
+            break
+        if not has_session(pkg):
+            continue
+        deep = f"'roblox://experiences/start?placeId={PLACE_ID}'"
+        run_su(f"am start -a android.intent.action.VIEW -d {deep} {pkg}", timeout=5)
+        windows_track(pkg, code=None)
+        launched += 1
+        time.sleep(2)
+    log(f"🚜 Фармеров-КЛОНОВ запущено: {launched} (main НЕ фармит)")
+    return launched
+
+def write_delta_lua(content):
+    try:
+        os.makedirs(os.path.dirname(DELTA_AUTOEXEC_PATH), exist_ok=True)
+        with open(DELTA_AUTOEXEC_PATH, "w") as f:
+            f.write(content)
+    except Exception as e:
+        b64 = base64.b64encode(content.encode()).decode()
+        ok, _, err = run_su(f"echo '{b64}' | base64 -d > '{DELTA_AUTOEXEC_PATH}'", timeout=10)
+        if not ok:
+            log(f"❌ lua write: {e} / {err}")
+            return False
+    run_su(f"chmod 644 '{DELTA_AUTOEXEC_PATH}'", timeout=3)
+    return True
+
+def pkg_alive(pkg):
+    ok, out, _ = run_su(f"pidof {pkg}", timeout=5)
+    if ok and out.strip():
+        return True
+    ok, out, _ = run_su(f"ps -A 2>/dev/null | grep -w '{pkg}' | grep -v grep", timeout=10)
+    return bool(ok and out.strip())
+
+def pool_recheck_when_empty():
+    """☁️ Дотягиваем клонов до FARMERS_LIMIT, живые сессии НЕ трогаем."""
+    now = time.time()
+    if now - _last_pool_recheck[0] < 1800:
+        return
+    _last_pool_recheck[0] = now
+    cur = count_sessions()
+    if cur >= FARMERS_LIMIT:
+        return
+    empty = [p for p in _farm_pkgs() if not has_session(p)]
+    need = min(FARMERS_LIMIT - cur, len(empty))
+    if need <= 0:
+        return
+    log(f"☁️ Сессий клонов {cur}/{FARMERS_LIMIT} — тихая перепроверка пула (+{need})")
+    claimed = pool_topup(need)
+    if claimed:
+        _okc, recycle = do_injection(claimed, only_empty=True)
+        _recycle_cookies(recycle, claimed)
+        if count_sessions() > cur:
+            log("✅ Пул дал куки — фармеры-клоны подняты")
+            farm_sessions_up()
+
+# ============================================================
+# 📋 БУФЕР / ZEN API
+# ============================================================
+def _termux_clip():
+    for exe in ("termux-clipboard-get", "/data/data/com.termux/files/usr/bin/termux-clipboard-get"):
+        try:
+            res = subprocess.run([exe], capture_output=True, text=True, timeout=3)
+            if res.returncode == 0:
+                return res.stdout.strip()
+        except Exception:
+            continue
+    return ""
+
+_CLIP_CMDS = (
+    "service call clipboard 2 s16 com.termux i32 0",
+    "service call clipboard 2 s16 com.termux s16 com.termux i32 0",
+    "service call clipboard 2 i32 0",
+)
+
+def _service_clip_text():
+    for cmd in _CLIP_CMDS:
+        ok, out, _ = run_su(cmd, timeout=5)
+        if not ok:
+            continue
+        tokens = re.findall(r'\b[0-9a-fA-F]{8}\b', out)
+        if not tokens:
+            continue
+        data = b''.join(bytes.fromhex(t)[::-1] for t in tokens)
+        return data.decode('utf-16-le', errors='ignore').replace('\x00', ' ')
+    return ""
+
+def _paste_probe():
+    run_su(f"input tap {OMNIBOX_TAP[0]} {OMNIBOX_TAP[1]}")
+    time.sleep(1.5)
+    run_su("input keyevent 279")
+    time.sleep(2)
+    texts = []
+    for _ in range(2):
+        texts = get_visible_text()
+        if any(_looks_like_url(t) or KEY_RE.search(t) for t in texts):
+            break
+        time.sleep(1.5)
+    return texts
+
+def _key_from_texts(texts):
+    for t in texts:
+        m = KEY_RE.search(t)
+        if m:
+            return m.group(1)
+    candidates = [t.strip() for t in texts if _plausible_key(t)]
+    if candidates:
+        candidates.sort(key=len, reverse=True)
+        log(f"⚠️ Фолбэк-ключ (самый длинный текст): {candidates[0][:60]}")
+        return candidates[0]
+    return None
+
+def get_clipboard():
+    t = _termux_clip()
+    if t and _looks_like_url(t):
+        return _normalize_url(t)
+    m = re.search(r'https?://\S+', _service_clip_text())
+    if m:
+        return m.group(0)
+    for t in _paste_probe():
+        if _looks_like_url(t):
+            return _normalize_url(t)
+    return ""
+
+def _plausible_key(t):
+    if not t:
+        return False
+    if KEY_RE.search(t):
+        return True
+    t = t.strip()
+    if _looks_like_url(t):
+        return False
+    return 10 <= len(t) <= 120 and " " not in t and "\n" not in t
+
+def get_copied_key():
+    time.sleep(2)
+    t = _termux_clip()
+    if t:
+        m = KEY_RE.search(t)
+        if m:
+            return m.group(1)
+        if _plausible_key(t):
+            return t.strip()
+    m = KEY_RE.search(_service_clip_text())
+    if m:
+        return m.group(1)
+    k = _key_from_texts(get_visible_text())
+    if k:
+        return k
+    return _key_from_texts(_paste_probe())
+
+def get_bypassed_link(original_link, depth=0):
+    try:
+        r = _HTTP.get(ZEN_API_URL, params={"url": original_link},
+                      headers={"x-api-key": ZEN_API_KEY}, timeout=25)
+        if r.status_code == 429:
+            if depth >= 3:
+                return None
+            time.sleep(60)
+            return get_bypassed_link(original_link, depth + 1)
+        data = r.json()
+        bypassed = data.get("result") or data.get("destination") or data.get("link")
+        if bypassed and bypassed.startswith("http"): return bypassed
+        match = re.search(r'(https?://[^\s"]+)', r.text)
+        if match: return match.group(1)
+    except Exception as e:
+        log(f"❌ Zen API: {e}")
+    return None
+
+_URI_KEYS = {
+    "-": ("keyevent", "69"),  "_": ("keycombination", "59 69"),
+    ".": ("keyevent", "56"),  "/": ("keyevent", "76"),
+    ":": ("keycombination", "59 74"), "?": ("keycombination", "59 76"),
+    "=": ("keyevent", "70"), "&": ("keycombination", "59 14"),
+    "%": ("keycombination", "59 12"), "+": ("keycombination", "59 70"),
+    "~": ("keycombination", "59 68"),
+}
+
+def inject_url_via_ui(url):
+    if not url: return False
+    host = re.sub(r'^https?://', '', url).split('/')[0].split(':')[0].lower()
+    escaped = url.replace("'", "'\\''")
+    ok, _, _err = run_su(f"am start -a android.intent.action.VIEW -d '{escaped}'", timeout=10)
+    if ok:
+        time.sleep(5)
+        texts = [t.lower() for t in get_visible_text()]
+        if any(host in t for t in texts):
+            return True
+        if host in get_visible_url().lower():
+            return True
+    escaped2 = url.replace("'", "'\\''").replace('"', '\\"')
+    run_su(f"echo '{escaped2}' | termux-clipboard-set", timeout=5)
+    run_su(f"service call clipboard 1 s16 '{escaped2}'", timeout=5)
+    tap(*OMNIBOX_TAP, 0.3)
+    tap(*OMNIBOX_TAP, 0.3)
+    tap(*OMNIBOX_TAP, 0.5)
+    time.sleep(1)
+    select_all_delete()
+    run_su("input keyevent 279", timeout=5)
+    time.sleep(1.5)
+    vis = get_visible_url()
+    if host in vis.lower() and len(vis) >= len(url) * 0.8:
+        run_su("input keyevent 66", timeout=5)
+        return True
+    select_all_delete()
+    all_ok = True
+    for ch in [url[i:i + 150] for i in range(0, len(url), 150)]:
+        safe = ch.replace("'", "'\\''").replace(" ", "%s")
+        ok2, _, _ = run_su(f"input text '{safe}'", timeout=10)
+        if not ok2:
+            all_ok = False
+            break
+        time.sleep(0.15)
+    if all_ok:
+        run_su("input keyevent 66", timeout=5)
+        return True
+    select_all_delete()
+    for ch in url:
+        low = ch.lower()
+        if ch in _URI_KEYS:
+            kind, arg = _URI_KEYS[ch]
+            run_su(f"input {kind} {arg}", timeout=3)
+        elif low in KEYCODE_LOWER:
+            code = KEYCODE_LOWER[low]
+            run_su(f"input keycombination 59 {code}" if ch.isupper() else f"input keyevent {code}", timeout=3)
+        elif low in KEYCODE_DIGIT:
+            run_su(f"input keyevent {KEYCODE_DIGIT[low]}", timeout=3)
+        else:
+            safe = ch.replace("'", "'\\''")
+            run_su(f"input text '{safe}'", timeout=3)
+        time.sleep(0.02)
+    run_su("input keyevent 66", timeout=5)
+    time.sleep(1)
+    return True
+
+# ============================================================
+# 🔴 КЛЮЧ В DELTA / БАЙПАС
+# ============================================================
+def write_key_via_ui(key):
+    wake_screen()
+    launch_delta()
+    time.sleep(KEY_WRITE_WAIT)
+    tap(*OMNIBOX_TAP, 1)
+    tap(*INPUT_FIELD, 1)
+    select_all_delete()
+    time.sleep(0.5)
+    type_text(key)
+    time.sleep(1)
+    run_su("input keyevent 66", timeout=5)
+    time.sleep(1)
+    tap(*ACCEPT_BTN, 2)
+    time.sleep(6)
+    log("📲 Ключ записан в Delta")
+
+def run_bypass_cycle(max_attempts=None):
+    n = max_attempts if (max_attempts and max_attempts > 0) else BYPASS_RETRIES
+    try:
+        for attempt in range(1, n + 1):
+            check_stop()
+            logv(f"🔁 Байпас {attempt}/{n}: фаза 1")
+            kill_all_roblox()
+            wake_screen()
+            launch_delta()
+            time.sleep(UI_INITIAL_DELAY)
+
+            tap(*LINK_TAP, UI_STEP_DELAYS["LINK_TAP"])
+            set_landscape()
+            time.sleep(UI_STEP_DELAYS["SET_LANDSCAPE"])
+            tap(*CLOSE_TRANSL_1, UI_STEP_DELAYS["CLOSE_TRANSL_1"])
+            tap(*TRIGGER_AD, UI_STEP_DELAYS["TRIGGER_AD"])
+            tap(*CLOSE_AD, UI_STEP_DELAYS["CLOSE_AD"])
+            tap(*CONTINUE_1, UI_STEP_DELAYS["CONTINUE_1"])
+            tap(*GOOGLE_ROW, UI_STEP_DELAYS["GOOGLE_ROW"])
+            tap(*COPY_LINK, UI_STEP_DELAYS["COPY_LINK"])
+            time.sleep(COPY_SETTLE_DELAY)
+
+            copied_link = get_clipboard()
+            if not _looks_like_url(copied_link):
+                logv("⚠️ Ссылка не получена")
+                time.sleep(3); continue
+            copied_link = _normalize_url(copied_link)
+
+            bypassed_link = get_bypassed_link(copied_link)
+            if not bypassed_link:
+                logv("⚠️ Байпас ссылки не удался")
+                time.sleep(5); continue
+
+            if not inject_url_via_ui(bypassed_link):
+                logv("⚠️ Ввод ссылки не удался")
+                time.sleep(3); continue
+
+            time.sleep(UI_STEP_DELAYS["OPEN_ZEN_LINK"])
+            tap(*CONTINUE_KEY, UI_STEP_DELAYS["CONTINUE_KEY"])
+            tap(*CLOSE_TRANSL_2, UI_STEP_DELAYS["CLOSE_TRANSL_2"])
+            tap(*COPY_CODE, UI_STEP_DELAYS["COPY_CODE"])
+            time.sleep(3)
+            key = get_copied_key()
+
+            if not key:
+                kill_all_roblox()
+                time.sleep(7)
+                continue
+
+            log(f"🎯 КЛЮЧ ПОЛУЧЕН: {key[:50]}...")
+            state["last_key"] = key
+            state["last_key_time"] = utc_ts()
+            save_state()
+            write_key_via_ui(key)
+            kill_all_roblox()
+            return True
+        log(f"💥 Байпас не дал ключа за {n} попыток")
+        return False
+    finally:
+        set_portrait()
+        ui_cache_clear()
+
+def inject_key_simple(key):
+    if not key:
+        return False
+    for attempt in range(1, KEY_INJECT_RETRIES + 1):
+        check_stop()
+        logv(f"💉 Ввод ключа (фаза 2) {attempt}/{KEY_INJECT_RETRIES}")
+        kill_main_only()
+        wake_screen()
+        launch_delta()
+        time.sleep(UI_INITIAL_DELAY)
+        tap(*LINK_TAP, 0)
+        set_landscape()
+        time.sleep(KEY2_POST_LINK_DELAY)
+        tap(*CLOSE_TRANSL_2, 1)
+        tap(*COPY_CODE, 1)
+        time.sleep(3)
+        k = get_copied_key() or key
+        write_key_via_ui(k)
+        if attempt == KEY_INJECT_RETRIES:
+            time.sleep(20)
+    kill_main_only()
+    set_portrait()
+    return True
+
+def do_bypass_once(max_attempts=None, force=False):
+    """🔑 v6.5: force=True (режим farm / рестарт после вылета) —
+    байпас ВСЕГДА, БЕЗ проверок свежести ключа.
+    Обычный вызов — антидубль 25 мин."""
+    set_phase("KEY")
+    if force:
+        log("🔑 ПРИНУДИТЕЛЬНЫЙ байпас — свежесть ключа НЕ проверяю")
+    else:
+        lk = state.get("last_key_time", 0) or 0
+        age_min = (utc_ts() - lk) / 60.0 if lk else 1e9
+        if age_min < BYPASS_MIN_GAP_MIN:
+            logv(f"🔑 Ключ свежий ({age_min:.0f} мин) — байпас не нужен")
+            return True
+    n = max_attempts if (max_attempts and max_attempts > 0) else BYPASS_RETRIES
+    log(f"🔑 Байпас: фаза 1 ×{n} → фаза 2 ×{KEY_INJECT_RETRIES}")
+    write_delta_lua(NOOP_LUA)
+    pre_ts = state.get("last_key_time", 0) or 0
+    try:
+        run_bypass_cycle(max_attempts=n)
+        if (state.get("last_key_time", 0) or 0) > pre_ts and state.get("last_key"):
+            inject_key_simple(state["last_key"])
+            log("✅ Байпас завершён — новый ключ записан")
+            return True
+        log("❌ Байпас НЕ дал нового ключа — работаем на старом")
+        return False
+    finally:
+        write_delta_lua(FARM_LUA_CONTENT)
+        ui_cache_clear()
+
+# ============================================================
+# 💾 СОСТОЯНИЕ
+# ============================================================
+def load_state():
+    global state
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                state.update(json.load(f))
+        except Exception:
+            pass
+    state.setdefault("last_key", "")
+    state.setdefault("last_key_time", 0.0)
+    state.setdefault("done_slots", [])
+    state.setdefault("last_reg_date", "")
+    state.setdefault("last_restart_notice_ts", 0)
+
+def save_state():
+    _atomic_write_json(STATE_FILE, state)
+
+# ============================================================
+# 🌾 УРОЖАЙ (входят ТОЛЬКО КЛОНЫ)
+# ============================================================
+_SHARE_CODE_RE = re.compile(r'(?:privateServerLinkCode=|share\?code=)([A-Za-z0-9_\-]+)')
+
+def _parse_servers_text(text):
+    text = (text or "").lstrip("\ufeff").strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        data = None
+    if data is not None:
+        if isinstance(data, dict) and isinstance(data.get("servers"), list):
+            data = data["servers"]
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and data.get("code"):
+            return [data]
+        log("⚠️ servers: JSON распознан, но структура неясна")
+        return []
+    out = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("//"):
+            continue
+        owner = ""
+        for sep in ("|", ";", "\t"):
+            if sep in line:
+                left, right = line.split(sep, 1)
+                left, right = left.strip(), right.strip()
+                if left and right:
+                    line, owner = left, right
+                    break
+        m = _SHARE_CODE_RE.search(line)
+        if m:
+            line = m.group(1)
+        else:
+            parts = line.replace(",", " ").split()
+            if parts:
+                line = parts[0]
+                if not owner and len(parts) > 1:
+                    owner = parts[1]
+        if line and len(line) >= 4:
+            out.append({"code": line, "owner": owner} if owner else line)
+    return out
+
+def load_servers():
+    if not SERVERS_JSON_URL:
+        log("⚠️ SERVERS_JSON_URL не задан")
+        return []
+    text = ""
+    m = re.match(r'https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/(?:refs/heads/)?([^/]+)/(.+)',
+                 SERVERS_JSON_URL)
+    if m and GH_TOKEN:
+        user, repo, branch, path = m.groups()
+        try:
+            r2 = _HTTP.get(f"https://api.github.com/repos/{user}/{repo}/contents/{path}",
+                           params={"ref": branch},
+                           headers={"Authorization": f"Bearer {GH_TOKEN}",
+                                    "Accept": "application/vnd.github.raw",
+                                    "User-Agent": PHONE_ID},
+                           timeout=15)
+            if r2.status_code == 200:
+                text = r2.text
+            else:
+                logv(f"⚠️ servers API: HTTP {r2.status_code}")
+        except Exception as e:
+            logv(f"⚠️ servers API: {e}")
+    if not text:
+        try:
+            r = _HTTP.get(f"{SERVERS_JSON_URL}?t={int(time.time())}", timeout=15)
+            if r.status_code == 200:
+                text = r.text
+        except Exception as e:
+            logv(f"⚠️ servers raw: {e}")
+    if not text or not text.strip():
+        log("⚠️ servers: файл пуст или недоступен")
+        return []
+    servers = _parse_servers_text(text)
+    logv(f"📄 servers: {len(servers)} записей" if servers
+         else "⚠️ servers: не распознано ни одной приватики")
+    return servers
+
+def server_code(entry):
+    if isinstance(entry, dict):
+        return entry.get("code", ""), entry.get("owner", "")
+    return str(entry), ""
+
+def _owner_of(owner_field):
+    if not owner_field:
+        return ""
+    return re.split(r'[;,]', str(owner_field))[0].strip()
+
+def my_group_no():
+    g = ((PHONE_INDEX - FARM_GROUP_BASE) // FARMERS_PER_COLLECTOR) % NUM_COLLECTORS + 1
+    return max(1, min(NUM_COLLECTORS, g))
+
+def my_server_codes():
+    servers = load_servers()
+    pairs = [server_code(s) for s in servers]
+    g = my_group_no()
+    mine_tagged = [c for c, owner in pairs if c and _owner_of(owner) == f"collector-{g}"]
+    if mine_tagged:
+        return mine_tagged, "теги"
+    if any(o for _c, o in pairs):
+        return [], "теги-нет-моей"
+    codes = [c for c, _o in pairs if c]
+    start = (g - 1) * GROUP_SIZE
+    return codes[start:start + GROUP_SIZE], "блок"
+
+def do_harvest_slot(batch_no):
+    set_phase(f"HARVEST-{batch_no + 1}")
+    g = my_group_no()
+    log(f"🌾 Слот {batch_no + 1} — 🔑 байпас перед входом (группа {g})")
+    rem_min0 = minutes_to_next_boundary()
+    n_bp = int(max(1.0, min(float(BYPASS_RETRIES),
+                            (rem_min0 - HARVEST_MIN_JOIN_MIN - 1.0) / 3.5)))
+    do_bypass_once(max_attempts=n_bp)
+
+    rem_min = minutes_to_next_boundary()
+    if rem_min < HARVEST_MIN_JOIN_MIN:
+        log(f"⏰ После байпаса до конца слота {rem_min:.0f} мин — захожу не буду")
+        write_delta_lua(FARM_LUA_CONTENT)
+        set_phase("FARM")
+        wait_out_slot(("harvest", batch_no))
+        return
+
+    my_codes, how = my_server_codes()
+    if not my_codes:
+        why = ("в bank12 нет серверов моей группы collector-" + str(g)) \
+              if how == "теги-нет-моей" else "bank12 пуст/недоступен"
+        log(f"🆘 {why} — слот {batch_no + 1} пропущен")
+        tg_send(f"🆘 {PHONE_ID}: {why} — слот {batch_no + 1} ПРОПУЩЕН", silent=True)
+        write_delta_lua(FARM_LUA_CONTENT)
+        set_phase("FARM")
+        wait_out_slot(("harvest", batch_no))
+        return
+    if how == "теги":
+        logv(f"🏷️ Мои серверы (теги collector-{g}): {len(my_codes)} шт")
+    else:
+        start = (g - 1) * GROUP_SIZE
+        logv(f"🎯 Мои серверы (блок #{start + 1}..#{start + len(my_codes)}): {len(my_codes)} шт")
+
+    kill_all_roblox()
+    if HARVEST_LUA_CONTENT.strip():
+        write_delta_lua(HARVEST_LUA_CONTENT)
+    else:
+        log("⚠️ HARVEST_LUA пуст — остаётся farm.lua")
+
+    stagger = (PHONE_INDEX % FARMERS_PER_COLLECTOR) * 3.0
+    if stagger > 0:
+        time.sleep(stagger)
+
+    joined = 0
+    joined_map = []
+    for pkg in _farm_pkgs():                       # ← v6.5: ТОЛЬКО КЛОНЫ
+        if joined >= FARMERS_LIMIT:
+            break
+        if not has_session(pkg):
+            continue
+        code = my_codes[joined % len(my_codes)]
+        launch_private(pkg, code)
+        windows_track(pkg, code=code)
+        joined_map.append(f"{pkg.split('.')[-1] or pkg}→srv{(joined % len(my_codes)) + 1}")
+        joined += 1
+        time.sleep(2)
+    log(f"🌾 Пачка {batch_no + 1} | группа {g} | [{', '.join(joined_map)}] | акков: {joined}")
+    if joined == 0:
+        log(f"🆘 Слот {batch_no + 1}: 0 акков вошло — урожай НЕ сдан")
+        tg_send(f"🆘 {PHONE_ID}: слот {batch_no + 1} — 0 акков вошло (нет сессий), урожай не сдан",
+                silent=True)
+
+    sleep_stop(max(120.0, minutes_to_next_boundary() * 60 - LAUNCH_SETTLE))
+    kill_all_roblox()
+    set_portrait()
+    write_delta_lua(FARM_LUA_CONTENT)
+    set_phase("FARM")
+    log(f"✅ Урожай сдан (пачка {batch_no + 1}, группа {g})")
+    ui_cache_clear()
+
+# ============================================================
+# 🐄 ФАРМ 24/7 (ТОЛЬКО КЛОНЫ)
+# ============================================================
+def farm_sessions_up():
+    kill_all_roblox()
+    n = launch_roblox_light_farm()
+    if n == 0:
+        log("⚠️ 0 фармеров — ни в одном КЛОНЕ нет сессии!")
+    set_phase("FARM")
+
+def farm_continuous():
+    farm_sessions_up()
+    while True:
+        check_stop()
+        if utc_slot()[0] != "farm":
+            return
+        pool_recheck_when_empty()
+        rem = minutes_to_next_boundary()
+        after = _after_slots_now()
+        if rem <= 2:
+            if after:
+                sleep_stop(150)
+                continue
+            sleep_stop(max(5.0, rem * 60.0))
+            return
+        sleep_stop(min(max(rem - 2.0, 0.5), 15.0) * 60.0)
+
+# ============================================================
+# 🗓 ДНЕВНОЙ ЦИКЛ
+# ============================================================
+def _slots_done_today():
+    return _hour_now() >= HARVEST_UTC_HOUR + HARVEST_BATCHES * HARVEST_SLOT_MIN / 60.0
+
+def rega_fits_before_window():
+    rem = harvest_minutes_away()
+    if rem <= REGA_ESTIMATE_MIN:
+        log(f"⏰ До окна урожая {rem:.0f} мин (<{REGA_ESTIMATE_MIN}) — рега отложена")
+        return False
+    return True
+
+def _topup_and_inject_if_empty(reason=""):
+    """v6.5: добор кук из пула ТОЛЬКО в пустые КЛОНЫ (main не трогаем)."""
+    cur = count_sessions()
+    if cur > 0:
+        return True
+    log(f"⚠️ Сессий клонов 0{(' (' + reason + ')') if reason else ''} — добираю куки из пула")
+    set_phase("POOL")
+    claimed = []
+    empty = [p for p in _farm_pkgs() if not has_session(p)]
+    if empty:
+        claimed = pool_topup(min(FARMERS_LIMIT, len(empty)))
+        if claimed:
+            set_phase("INJECT")
+            _okc, recycle = do_injection(claimed, only_empty=True)
+            _recycle_cookies(recycle, claimed)
+    if count_sessions() > 0:
+        log(f"✅ После добора из пула: {count_sessions()} сессий клонов")
+        return True
+    log("🆘 0 сессий клонов и пул пуст — фарм без акков")
+    tg_send(f"🆘 {PHONE_ID}: 0 сессий клонов и пул пуст — фарм без акков"
+            f"{(' (' + reason + ')') if reason else ''}", silent=True)
+    return False
+
+def _do_cycle_registration():
+    check_stop()
+    log("🗓 Конец дневного цикла — регистрация новой партии")
+    phase_registration_and_login(DEFAULT_TARGET)
+    write_delta_lua(FARM_LUA_CONTENT)
+    if count_sessions() == 0:
+        log("🆘 Рега и пул не дали сессий — фарм без акков")
+        tg_send(f"🆘 {PHONE_ID}: рега+пул = 0 сессий — фарм без акков до следующей рега",
+                silent=True)
+    state["last_reg_date"] = _today_str()
+    save_state()
+
+def farm_loop_forever(force_start_bypass=False):
+    """🔄 ГЛАВНЫЙ ЦИКЛ. force_start_bypass=True — режим 'farm' (автозапуск):
+    🔑 байпас ПЕРВЫМ ДЕЛОМ, принудительно, без проверок."""
+    heartbeat_start()
+    load_state()
+    set_portrait()
+    g = my_group_no()
+    log("🔄 ЦИКЛ: [🔑байпас → ФАРМ] → [🔑байпас → СЛОТ] → РЕГА → по кругу")
+    log(f"🌾 Урожай: {HARVEST_MSK_HOUR}:00 МСК = {HARVEST_UTC_HOUR}:00 UTC | оба слота")
+    log(f"🎯 Группа {g} → collector-{g} | схема {NUM_COLLECTORS}×{GROUP_SIZE} | "
+        f"{FARMERS_PER_COLLECTOR} фармеров/сборщик (base={FARM_GROUP_BASE})")
+    write_delta_lua(FARM_LUA_CONTENT)
+
+    # 🔑 БАЙПАС ПЕРЕД ФАРМОМ — первый шаг, всегда
+    if force_start_bypass:
+        log("🔑 Байпас ПЕРЕД фармом (режим автозапуска — ПРИНУДИТЕЛЬНЫЙ)")
+        do_bypass_once(force=True)
+    else:
+        log("🔑 Байпас перед фармом")
+        do_bypass_once()
+
+    # ☁️ добор кук в ПУСТЫЕ клоны (если после вылета что-то потеряли)
+    _topup_and_inject_if_empty("старт")
+
+    # 🗓 суточная рега (после сегодняшних слотов, если ещё не была)
+    if _slots_done_today() and state.get("last_reg_date") != _today_str():
+        _do_cycle_registration()
+        log("🔑 Байпас после регистрации — перед фармом")
+        do_bypass_once()
+
+    done_slots = set(state.get("done_slots", []))
+    while True:
+        check_stop()
+        slot, batch = utc_slot()
+        if slot == "harvest":
+            slot_key = f"{utc_now().date()}#{batch}"
+            if slot_key not in done_slots:
+                do_harvest_slot(batch)
+                done_slots.add(slot_key)
+                state["done_slots"] = sorted(done_slots)[-8:]
+                save_state()
+            else:
+                wait_out_slot(("harvest", batch))
+            continue
+        if _slots_done_today() and state.get("last_reg_date") != _today_str():
+            _do_cycle_registration()
+            log("🔑 Байпас после регистрации — перед фармом")
+            do_bypass_once()
+            continue
+        farm_continuous()
+
+# ============================================================
+# 🖥️ ДЕЖУРСТВО + КОМАНДЫ ТГ
+# ============================================================
+def monitor_lock_read():
+    sha, content = gh_get(MONITOR_LOCK_PATH)
+    if not sha:
+        return None, None
+    try:
+        return json.loads(content), sha
+    except Exception:
+        return {}, sha
+
+def _lock_write(meta, sha):
+    return gh_put(MONITOR_LOCK_PATH, json.dumps(meta), silent=True, sha=sha)
+
+def monitor_try_lock():
+    if not (GH_TOKEN and GH_REPO and TG_BOT_TOKEN):
+        return False
+    body = json.dumps({"phone": PHONE_ID, "ts": utc_ts()})
+    if gh_put(MONITOR_LOCK_PATH, body, expect_create=True, silent=True):
+        return True
+    meta, sha = monitor_lock_read()
+    if not meta or not meta.get("phone"):
+        if sha:
+            logv("🔧 Битый monitor_lock — пересоздаю")
+            gh_delete(MONITOR_LOCK_PATH)
+        return gh_put(MONITOR_LOCK_PATH, body, expect_create=True, silent=True)
+    if meta.get("phone") == PHONE_ID:
+        if utc_ts() - meta.get("ts", 0) < MONITOR_LOCK_TTL:
+            monitor_touch_lock()
+            return True
+        gh_delete(MONITOR_LOCK_PATH)
+        return gh_put(MONITOR_LOCK_PATH, body, expect_create=True, silent=True)
+    if utc_ts() - meta.get("ts", 0) < MONITOR_LOCK_TTL:
+        return "BUSY"
+    gh_delete(MONITOR_LOCK_PATH)
+    return gh_put(MONITOR_LOCK_PATH, body, expect_create=True, silent=True)
+
+def monitor_touch_lock():
+    meta, sha = monitor_lock_read()
+    if not sha:
+        return monitor_try_lock()
+    if not meta or meta.get("phone") != PHONE_ID:
+        return False
+    meta["ts"] = utc_ts()
+    if _TG_OFFSET[0]:
+        meta["tg_offset"] = _TG_OFFSET[0]
+    if _lock_write(meta, sha):
+        return True
+    meta2, sha2 = monitor_lock_read()
+    if sha2 and meta2 and meta2.get("phone") == PHONE_ID:
+        meta2["ts"] = utc_ts()
+        if _TG_OFFSET[0]:
+            meta2["tg_offset"] = _TG_OFFSET[0]
+        return _lock_write(meta2, sha2)
+    return False
+
+def _monitor_save_offset():
+    meta, sha = monitor_lock_read()
+    if not sha or not meta or meta.get("phone") != PHONE_ID:
+        return False
+    meta["ts"] = utc_ts()
+    meta["tg_offset"] = _TG_OFFSET[0]
+    return _lock_write(meta, sha)
+
+def _tg_get(offset):
+    try:
+        r = _HTTP.get(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getUpdates",
+                      params={"offset": offset, "timeout": 25,
+                              "allowed_updates": '["message"]'}, timeout=35)
+        if r.status_code == 200:
+            return r.json().get("result", []), True
+        if r.status_code == 409:
+            _TG_CONFLICT[0] = True
+        return [], False
+    except Exception:
+        return [], False
+
+def fleet_status_all():
+    rows = []
+    for name, _sha in gh_list(FLEET_DIR):
+        c = gh_get(f"{FLEET_DIR}/{name}")[1]
+        if c:
+            try:
+                rows.append(json.loads(c))
+            except Exception:
+                pass
+    return rows
+
+def fleet_digest():
+    rows = fleet_status_all()
+    by_phone = {r.get("phone"): r for r in rows}
+    now = utc_ts()
+    phones = sorted(set(by_phone) | set(_last_seen))
+    if not phones:
+        return "📊 Флот: данных нет"
+    fresh, stale = [], []
+    for p in phones:
+        ref = max(_last_seen.get(p, 0), by_phone.get(p, {}).get("ts", 0))
+        (fresh if ref and now - ref <= _STALE_SEC else stale).append(p)
+    ph = Counter(by_phone[p].get("phase", "?") for p in fresh if p in by_phone)
+    lines = [f"📊 ФЛОТ {msk_now().strftime('%d.%m %H:%M')} МСК | online {len(fresh)}/{len(phones)}"]
+    lines += [f"• {k}: {v}" for k, v in ph.most_common()]
+    if stale:
+        lines.append("🆘 молчат: " + ", ".join(stale))
+    return "\n".join(lines)
+
+def grid_info():
+    slot, batch = utc_slot()
+    now_m = msk_now()
+    lk = state.get("last_key_time", 0) or 0
+    kage = f"{(utc_ts() - lk) / 3600:.1f}ч" if lk else "—"
+    g = my_group_no()
+    return (f"🌾 СЕТКА: {now_m.strftime('%H:%M')} МСК | {slot}"
+            + (f" пачка {batch + 1}" if batch >= 0 else "")
+            + f" | до границы {minutes_to_next_boundary():.0f} мин\n"
+            + f"• урожай: {HARVEST_MSK_HOUR}:00 МСК | 2 слота | группа {g} → collector-{g}\n"
+            + f"• ключ: {kage} | сессий КЛОНОВ: {count_sessions()} (main не фармит)\n"
+            + f"• я: {PHONE_ID} idx={PHONE_INDEX}\n"
+            + f"• супервайзер: {'🟢 жив' if _ka_supervisor_running() else '🔴 нет'}")
+
+_COOKIE_IN_LINE_RE = re.compile(
+    r"\.?ROBLOSECURITY[\"']?\s*[:=\t]\s*[\"']?([^\s\"',;]+)")
+
+def _cookie_like(v):
+    return len(v) >= TG_COOKIE_MIN_LEN and \
+           ("|" in v or "_" in v or len(v) >= 100)
+
+def extract_cookies_from_text(text):
+    out = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("/"):
+            continue
+        found = False
+        for m in _COOKIE_IN_LINE_RE.finditer(line):
+            val = m.group(1).rstrip("\"',;").strip("|")
+            if len(val) >= 40:
+                out.append(val)
+                found = True
+        if found:
+            continue
+        line = line.strip("`\"',; |\t")
+        if not line or line[0] in "[{\"":
+            continue
+        if "=" in line and "://" not in line:
+            k, v = line.split("=", 1)
+            v = v.strip()
+            if k and _cookie_like(v) and " " not in v and "\t" not in v:
+                out.append(v)
+                continue
+        if (" " in line) or ("\t" in line) or ("://" in line) or line.startswith("💚"):
+            continue
+        if len(line) >= TG_COOKIE_MIN_LEN:
+            out.append(line)
+    return list(dict.fromkeys(out))
+
+def _tg_download_file_cookies(doc):
+    try:
+        r = _HTTP.get(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getFile",
+                      params={"file_id": doc["file_id"]}, timeout=15)
+        if r.status_code != 200:
+            log(f"📎 getFile: HTTP {r.status_code}")
+            return []
+        fp = r.json().get("result", {}).get("file_path")
+        if not fp:
+            return []
+        r2 = _HTTP.get(f"https://api.telegram.org/file/bot{TG_BOT_TOKEN}/{fp}", timeout=60)
+        if r2.status_code != 200:
+            log(f"📎 download: HTTP {r2.status_code}")
+            return []
+        text = r2.text
+    except Exception as e:
+        log(f"📎 download: {e}")
+        return []
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", "//")):
+            continue
+        out.extend(extract_cookies_from_text(line))
+    s = text.strip()
+    if len(out) <= 1 and (s.startswith("[") or s.startswith("{")):
+        try:
+            data = json.loads(s)
+        except Exception:
+            data = None
+        if isinstance(data, list):
+            for x in data:
+                if isinstance(x, str) and len(x.strip()) >= 40:
+                    out.append(x.strip())
+                elif isinstance(x, dict):
+                    for v in x.values():
+                        if isinstance(v, str) and len(v.strip()) >= 40:
+                            out.append(v.strip())
+        elif isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, str) and len(v.strip()) >= 40:
+                    out.append(v.strip())
+    return list(dict.fromkeys(out))
+
+def _pool_ingest_cookies(cookies, source_label):
+    added, dup, err = 0, 0, 0
+    for c in cookies:
+        up = pool_upload(c)
+        if up is True:
+            added += 1
+        elif up == "dup":
+            dup += 1
+        else:
+            err += 1
+    n = pool_count()
+    return (f"🍪 {PHONE_ID}: {source_label} → залито {added}"
+            + (f", дублей {dup}" if dup else "")
+            + (f", ошибок {err}" if err else "")
+            + f" | в пуле: {n if n >= 0 else '?'}")
+
+def _handle_cookie_file(msg, doc, drain=False):
+    fname = (doc.get("file_name") or "").lower()
+    mime = (doc.get("mime_type") or "").lower()
+    if not (fname.endswith((".txt", ".csv", ".json", ".log"))
+            or "text" in mime or "json" in mime):
+        logv(f"📎 Файл «{doc.get('file_name')}» не текстовый — пропущен")
+        return
+    d = msg.get("date", 0) or 0
+    if drain and d and (utc_ts() - d) > 24 * 3600:
+        return
+    cookies = _tg_download_file_cookies(doc)
+    if not cookies:
+        cap = (msg.get("caption") or "").strip()
+        if cap:
+            cookies = extract_cookies_from_text(cap)
+    if not cookies:
+        logv("📎 Кук в файле не нашёл")
+        return
+    log(_pool_ingest_cookies(cookies, f"файл «{doc.get('file_name')}»"))
+
+def _process_message(msg, drain=False):
+    try:
+        _process_message_inner(msg, drain)
+    except Exception as e:
+        log(f"⚠️ _process_message: {e}")
+
+def _process_message_inner(msg, drain=False):
+    doc = msg.get("document")
+    txt = (msg.get("text") or msg.get("caption") or "").strip()
+    if doc:
+        _handle_cookie_file(msg, doc, drain)
+        return
+    if not txt:
+        return
+    if txt.lower() in ("/cookie", "cookie", "/cookies_help"):
+        tg_send("📎 Кинь файлом (.txt) куки — по одной в строке. Зальются в пул.\n"
+                "Или просто текстом (ROBLOSECURITY=... или голая строка).\n"
+                "Проверить пул: /cookies")
+        return
+    cookies = extract_cookies_from_text(txt)
+    if cookies:
+        d = msg.get("date", 0) or 0
+        if drain and d and (utc_ts() - d) > 24 * 3600:
+            return
+        log(_pool_ingest_cookies(cookies, "ТГ-" + ("дренаж" if drain else "чат")))
+        return
+    if drain:
+        d = msg.get("date", 0) or 0
+        if d and (utc_ts() - d) > 600:
+            return
+    if not txt.startswith("/"):
+        return
+    parts = txt[1:].split()
+    if not parts:
+        return
+    cmd = parts[0].split("@")[0].lower()
+    if cmd == "status":
+        tg_send(fleet_digest())
+    elif cmd == "list":
+        rows = sorted(fleet_status_all(), key=lambda r: r.get("phone", ""))
+        now = utc_ts()
+        lines = []
+        for r in rows:
+            p = r.get("phone", "?")
+            ref = max(_last_seen.get(p, 0), r.get("ts", 0))
+            flag = "💚" if ref and now - ref <= _STALE_SEC else "🆘"
+            ka = r.get("key_age_h", -1)
+            ka_s = "—" if ka is None or ka < 0 else f"{ka}ч"
+            lines.append(f"{flag} {p:12} {r.get('phase', '?'):16} ключ {ka_s} 🔋{r.get('bat', '?')}")
+        for p in sorted(set(_last_seen) - {r.get("phone") for r in rows}):
+            lines.append(f"💚 {p:12} (только TG)")
+        tg_send_long("📱 ФЛОТ:\n" + ("\n".join(lines) or "пусто"), silent=True)
+    elif cmd == "grid":
+        tg_send(grid_info())
+    elif cmd == "cookies":
+        n = pool_count()
+        tg_send("☁️ Пул недоступен (GH_TOKEN/GH_REPO?)" if n < 0
+                else f"🍪 Кук в пуле: {n}")
+    elif cmd == "clean":
+        _prev = CURRENT_PHASE[0]
+        set_phase("CLEAN")
+        live, removed = clean_dead_cookies()
+        tg_send(f"🧹 {PHONE_ID}: cookies.txt — живых {live}, удалено {removed}")
+        set_phase(_prev)
+    elif cmd == "duty":
+        meta, _sha = monitor_lock_read()
+        if meta and meta.get("phone"):
+            tg_send(f"🖥️ Дежурный: {meta['phone']} (лок {int(utc_ts() - meta.get('ts', 0))}с назад)")
+        else:
+            tg_send("🖥️ Дежурного нет")
+    elif cmd == "ping":
+        tg_send(f"pong от {PHONE_ID}")
+    elif cmd in ("help", "start"):
+        g = my_group_no()
+        tg_send("Команды: /status /list /grid /cookies /clean /duty /ping /help\n"
+                "🍪 Куки: текстом в группу ИЛИ файлом .txt — попадут в пул.\n"
+                "🧹 /clean — чистка cookies.txt (мёртвые 401 + дубли).\n"
+                f"🌾 Урожай: {HARVEST_MSK_HOUR}:00 МСК ежесуточно (2 слота).\n"
+                f"🎯 Группа {g} → collector-{g} | {NUM_COLLECTORS}×{GROUP_SIZE} серверов.\n"
+                "🔑 Байпасы: перед фармом (после вылета — принудительный) + перед слотом.\n"
+                "🔇 В чат пишется только ответ на команды.")
+
+def _monitor_poll_loop():
+    meta, _sha = monitor_lock_read()
+    offset = (meta or {}).get("tg_offset", 0) or 0
+    if offset:
+        ups, ok = _tg_get(offset)
+        if not ok and not _TG_CONFLICT[0]:
+            log("⚠️ Сохранённый tg_offset невалиден — дренаж с нуля")
+            offset = 0
+    if not offset:
+        log("🧹 Дренаж старых апдейтов")
+        fails = 0
+        while True:
+            ups, ok = _tg_get(offset)
+            if not ok:
+                fails += 1
+                if fails >= 10 or _TG_CONFLICT[0]:
+                    break
+                time.sleep(5)
+                continue
+            fails = 0
+            if not ups:
+                break
+            for u in ups:
+                _process_message(u.get("message") or {}, drain=True)
+            offset = max([offset] + [u.get("update_id", 0) for u in ups]) + 1
+            if len(ups) < 100:
+                break
+        logv(f"🧹 Дренаж завершён (offset={offset})")
+    _TG_OFFSET[0] = offset
+    last_touch = time.time()
+    last_off_save = time.time()
+    while True:
+        if _TG_CONFLICT[0]:
+            _TG_CONFLICT[0] = False
+            log("🔒 TG 409 — сохраняю offset и отпускаю лок")
+            _monitor_save_offset()
+            gh_delete(MONITOR_LOCK_PATH)
+            return
+        if time.time() - last_touch >= MONITOR_LOCK_TOUCH:
+            if not monitor_touch_lock():
+                log("🔒 Лок потерян — ухожу")
+                _monitor_save_offset()
+                return
+            last_touch = time.time()
+        ups, ok = _tg_get(offset)
+        if not ok:
+            time.sleep(5)
+            continue
+        for u in ups:
+            offset = max(offset, u.get("update_id", 0)) + 1
+            _TG_OFFSET[0] = offset
+            if os.environ.get("DEBUG_TG"):
+                m0 = u.get("message") or {}
+                log(f"📥 chat={(m0.get('chat') or {}).get('id')} doc={bool(m0.get('document'))} "
+                    f"text={(m0.get('text') or m0.get('caption') or '')[:40]!r}")
+            _process_message(u.get("message") or {})
+        if ups and time.time() - last_off_save >= 30:
+            if _monitor_save_offset():
+                last_off_save = time.time()
+        time.sleep(1)
+
+def monitor_duty_loop():
+    if not (GH_TOKEN and GH_REPO and TG_BOT_TOKEN):
+        logv("monitor: нет GH_TOKEN/GH_REPO/TG_BOT_TOKEN — дежурство выключено")
+        return
+    time.sleep(random.uniform(5, 20))
+    fails_err, last_err_alert = 0, 0.0
+    while True:
+        try:
+            res = monitor_try_lock()
+            if res is True:
+                fails_err = 0
+                log("🖥️ Я ДЕЖУРНЫЙ монитор")
+                try:
+                    for r in fleet_status_all():
+                        p = r.get("phone")
+                        if p:
+                            _last_seen[p] = max(_last_seen.get(p, 0), r.get("ts", 0))
+                except Exception:
+                    pass
+                _monitor_poll_loop()
+            elif res == "BUSY":
+                fails_err = 0
+            else:
+                fails_err += 1
+                if fails_err == 3 or (time.time() - last_err_alert > 1800):
+                    log(f"⚠️ Дежурство НЕ взять (попытка {fails_err})")
+                    last_err_alert = time.time()
+                time.sleep(random.uniform(60, 180))
+                continue
+        except Exception as e:
+            log(f"🖥️ monitor: {e}")
+            time.sleep(60)
+        time.sleep(random.uniform(20, 60))
+
+# ============================================================
+# 🚀 MAIN / WATCHDOG
+# ============================================================
+def main():
+    _PROCESS_LAUNCH_NUM[0] += 1
+    is_crash_restart = _PROCESS_LAUNCH_NUM[0] > 1
+
+    args = sys.argv[1:]
+    os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    wake_lock()
+    if KEEP_SCREEN_ON:
+        run_su("svc power stayon true", timeout=5)
+    if PHONE_ID in ("", "phone-XX"):
+        log("⚠️⚠️⚠️ PHONE_ID НЕ ЗАПОЛНЕН!")
+    if PHONE_ROLE == "collector":
+        log("⛔ Это ФАРМЕРСКИЙ скрипт. Для сборщика используй collector.py!")
+        return
+    if args and args[0] != "farm":
+        log("Режимы: python farm.py (рега+фарм) | python farm.py farm (сразу фарм+байпас)")
+        return
+
+    if not acquire_lock():
+        return
+
+    is_farm_mode = bool(args and args[0] == "farm")
+    if is_farm_mode:
+        if stop_requested():
+            log("🛑 Найден STOP — farm-режим не запускается (автозапуск остановлен)")
+            release_lock()
+            return
+    else:
+        if _PROCESS_LAUNCH_NUM[0] == 1:
+            try:
+                if os.path.exists(STOP_FILE):
+                    os.remove(STOP_FILE)
+                    log("🧹 Удаляю старый STOP-файл — свежий запуск")
+            except Exception:
+                pass
+            run_su("rm -f /data/local/tmp/.farm_stop 2>/dev/null", timeout=5)
+        elif stop_requested():
+            log("🛑 STOP-файл — останавливаюсь после краша")
+            release_lock()
+            return
+
+    keepalive_install()
+    windows_watchdog_start()
+
+    load_state()
+    measure_clock_offset()
+    fleet_status_put()
+
+    g = my_group_no()
+    log(f"🤖 v6.5 | {PHONE_ID}#{PHONE_INDEX} | группа {g} → collector-{g} | "
+        f"урожай {HARVEST_MSK_HOUR}:00 МСК | оба слота | 🚜 фармят ТОЛЬКО клоны")
+
+    heartbeat_start()
+
+    if is_farm_mode:
+        log("🤖 РЕЖИМ: ФАРМ СРАЗУ (автозапуск после вылета)")
+        log("   1️⃣ 🔑 ПРИНУДИТЕЛЬНЫЙ байпас → 2️⃣ фарм клоны → 3️⃣ рега по суточному циклу")
+        ln = state.get("last_restart_notice_ts", 0) or 0
+        if utc_ts() - ln > 1800:
+            state["last_restart_notice_ts"] = int(utc_ts())
+            save_state()
+            tg_send(f"🔁 {PHONE_ID}: автозапуск фермы после вылета (режим farm, байпас → фарм)",
+                    silent=True)
+        farm_loop_forever(force_start_bypass=True)
+        return
+
+    if is_crash_restart:
+        n_sess = count_sessions()
+        log(f"🔍 Живых сессий у КЛОНОВ (после краша): {n_sess}")
+        if n_sess > 0:
+            log("🔁 Рестарт после краша: фарм без перерегистрации + принудительный байпас")
+            farm_loop_forever(force_start_bypass=True)
+            return
+        log("ℹ️ Краш во время регистрации — регистрирую с нуля")
+
+    if not rega_fits_before_window():
+        farm_loop_forever()
+        return
+
+    phase_registration_and_login(DEFAULT_TARGET)
+    farm_loop_forever()
+
+if __name__ == "__main__":
+    try:
+        signal.signal(signal.SIGTERM, lambda *_a: graceful_stop("SIGTERM (kill)"))
+    except Exception:
+        pass
+    _restarts = []
+    while True:
+        try:
+            main()
+            log("🏁 main() завершился штатно")
+            break
+        except KeyboardInterrupt:
+            log("🛑 Ctrl+C — процесс остановлен (supervisor поднимет фарм через ~60с)")
+            log("   Для ПОЛНОЙ остановки: sh ~/farm_stop.sh")
+            break
+        except StopFarm:
+            graceful_stop("STOP-файл")
+            break
+        except Exception as e:
+            log(f"💥 CRASH: {e}")
+            traceback.print_exc()
+            if stop_requested():
+                graceful_stop("STOP-файл (после краша)")
+                break
+            now = time.time()
+            _restarts = [t for t in _restarts if now - t < 3600]
+            if len(_restarts) >= MAX_RESTARTS_PER_HOUR:
+                log(f"🆘 {len(_restarts)}+ крашей за час — СТОП процесса "
+                    f"(supervisor поднимет позже)")
+                break
+            _restarts.append(now)
+            log(f"💥 {type(e).__name__} → рестарт через 2 мин")
+            time.sleep(120)
+    release_lock()
+
+2 скрипт:
+"""
+Roblox Signup v38 — v37 + гарантированный запуск при browserforge-дырах
+датасета (geoip → locale страны IP → 'No headers based on this input').
+
+ФИКС v38 (главный):
+  • Понятен корень ValueError: geoip=True заставляет camoufox внутренне
+    требовать от browserforge локаль страны exit-IP (pl-PL/de-DE/...).
+    В датасете browserforge нет заголовков для части локалей + случайной
+    версии Firefox → ValueError. en-US/en-CA — данных много; pl-PL/de-DE —
+    дыры. Поэтому Канада/США запускались, Германия/Польша — нет.
+  • Цепочка спасения в _run_session:
+      2 ретрая тех же параметров (версия Firefox выбирается случайно)
+      → убрать 'screen' → убрать 'window'
+      → ОТКЛЮЧИТЬ geoip (последний рубеж): timezone остаётся из явного
+        kwarg + синхронизация ОС (tzutil), WebRTC убит block_webrtc —
+        утечек нет; locale станет нейтральной (en-US) — слабый сигнал
+        в обмен на гарантированный запуск.
+  • RELAX_ORDER = ("screen", "window", "geoip").
+
+ФИКС v37: новый IP на каждый аккаунт (перекат preflight, сравнение с IP
+предыдущего акка); STATIC_USER_TEMPLATE/STATIC_PASS_TEMPLATE для сессий
+static-пулов.
+ФИКС v36: locale НЕ передаётся вручную (browserforge падал на de-DE).
+ФИКС v35: автодетект ротации 'на каждый запрос' (два preflight-запроса).
+ФИКС v34: трёхуровневый TZ-матч (UTC-смещение → один Windows-ID → имена).
+ФИКС v33: screen как объект Screen; geo-preflight c UA + фоллбеками.
+ФИКС v32: HTTP-схема (Firefox НЕ умеет SOCKS-auth); рандомный ник; паузы.
+ФИКС v31: синхронизация системного timezone Windows (tzutil), админ.
+ФИКС v30: preflight-резолв exit-IP + быстрый ретрай при "try again later".
+
+⚠️ ОБЯЗАТЕЛЬНО:
+    python -m pip install -U --force-reinstall "camoufox[geoip]"
+    camoufox fetch
+⚠️ Терминал ОТ ИМЕНИ АДМИНИСТРАТОРА (tzutil /s).
+⚠️ В ЛК proxy.market — sticky-ротация (текущая: 5 минут — ок).
+
+Запуск: python main.py [--debug]
+"""
+
+import base64
+import json
+import logging
+import math
+import random
+import re
+import secrets
+import string
+import subprocess
+import sys
+import time
+import urllib.request
+import warnings
+from datetime import datetime
+from pathlib import Path
+
+from camoufox.sync_api import Camoufox
+
+try:
+    from camoufox.utils import Screen
+except Exception:
+    Screen = None
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
+try:
+    from playwright._impl._errors import TargetClosedError
+except Exception:
+    TargetClosedError = None
+
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+
+warnings.filterwarnings("ignore", message=".*geoip=True.*")
+warnings.filterwarnings("ignore", message=".*When using a proxy.*")
+
+# ═══════════════════════════════════════════════════════════════════════
+# КОНФИГ
+# ═══════════════════════════════════════════════════════════════════════
+
+# --- аккаунты ---
+ACCOUNTS_TO_CREATE = 1
+ACCOUNT_RETRIES = 3
+ACCOUNT_PAUSE_MIN_S = 60
+ACCOUNT_PAUSE_MAX_S = 120
+RETRY_PAUSE_MIN_S = 60
+RETRY_PAUSE_MAX_S = 150
+
+# ─────────────────────────── ПРОКСИ ───────────────────────────
+PROXY_ENABLED = True
+PROXY_MODE = "static"       # "static" — один endpoint (пул сам ротирует IP)
+                            # "template" — bpproxy: каждая сессия = свой IP
+
+# "http" — РЕКОМЕНДУЕТСЯ (Firefox НЕ умеет SOCKS-auth → 407).
+PROXY_SCHEME = "http"
+
+# ── proxy.market (МОБИЛЬНЫЕ, ротация 5 мин) ──
+STATIC_SERVER = f"{PROXY_SCHEME}://mobpool.proxy.market:10000"
+STATIC_USER = "nFjes6x3qI"
+STATIC_PASS = "aQYiyCLQmU"
+
+# Сессии static-пула (если у пула есть привязка IP к сессии через логин):
+# пример формата — уточни в доках proxy.market, например:
+#   STATIC_USER_TEMPLATE = "nFjes6x3qI-session-{session}"
+STATIC_USER_TEMPLATE = None
+STATIC_PASS_TEMPLATE = None
+
+# ═══ СМЕНА IP НА КАЖДЫЙ АККАУНТ ═══
+NEW_IP_PER_ACCOUNT = True
+IP_ROLL_MAX_TRIES = 8
+IP_ROLL_PAUSE_S = 5
+
+# ── bpproxy.at — включается PROXY_MODE="template" ──
+PROXY_HOST = "residential-x.bpproxy.at"
+PROXY_PORT = 1000
+PROXY_USER = "bpuser-7C48om5b"
+PROXY_PASS_TEMPLATE = "89v1M8O8LMqSXHSOsJ9e_session-{session}_lifetime-{lifetime}"
+PROXY_SESSION_LEN = 8
+PROXY_LIFETIME_MIN = 30
+
+VERIFY_PROXY_IP = True
+CHECK_IP_URL = "https://api.ipify.org"
+GEO_JSON_URL = "https://get.geojs.io/v1/ip/geo.json"
+PROXY_PREFLIGHT = True
+PROXY_PREFLIGHT_TIMEOUT = 20
+ROTATION_PROBE = True
+ROTATION_PROBE_PAUSE_S = 2
+
+# ═══ ФИЛЬТР СТРАН ═══
+ALLOWED_COUNTRIES = []
+BLOCKED_COUNTRIES = []
+PREFLIGHT_MAX_TRIES = 6
+
+# ═══ TIMEZONE ═══
+SYNC_OS_TIMEZONE = True
+ENFORCE_TZ_MATCH = True
+TZ_ABORT_LIMIT = 2
+
+# ═══ LOCALE ═══
+# НЕ передаём вручную: geoip=True сам ставит locale из IP. Явная передача
+# идёт через browserforge и падает на部分 локалей ('No headers...').
+PASS_LOCALE_EXPLICITLY = False
+
+# --- навигация ---
+NAVIGATE_VIA_HOME = True
+HOME_URL = "https://www.roblox.com/"
+URL = "https://www.roblox.com/CreateAccount"
+
+# ═══ АНТИДЕТЕКТ ЖЕЛЕЗА ═══
+SCREEN_POOL = [
+    (1920, 1080), (1366, 768), (1536, 864), (1440, 900),
+    (1600, 900), (1280, 720), (2560, 1440), (1680, 1050),
+]
+CPU_CORES_POOL = [4, 6, 8, 12, 16]
+WINDOW_SCALE_MIN = 0.75
+WINDOW_SCALE_MAX = 1.0
+MANUAL_TIMEZONE = None
+MANUAL_LOCALE = None
+OS_LIST = ["windows"]
+
+COUNTRY_LOCALE = {
+    "RS": "sr-RS", "HR": "hr-HR", "SI": "sl-SI", "BA": "bs-BA", "MK": "mk-MK",
+    "AT": "de-AT", "DE": "de-DE", "CH": "de-CH",
+    "CZ": "cs-CZ", "SK": "sk-SK", "PL": "pl-PL", "HU": "hu-HU", "RO": "ro-RO",
+    "BG": "bg-BG", "GR": "el-GR", "IT": "it-IT", "ES": "es-ES", "PT": "pt-PT",
+    "FR": "fr-FR", "BE": "nl-BE", "NL": "nl-NL", "SE": "sv-SE", "NO": "nb-NO",
+    "DK": "da-DK", "FI": "fi-FI", "EE": "et-EE", "LV": "lv-LV", "LT": "lt-LT",
+    "UA": "uk-UA", "GB": "en-GB", "IE": "en-IE",
+    "US": "en-US", "CA": "en-CA", "AU": "en-AU", "NZ": "en-NZ",
+    "BR": "pt-BR", "MX": "es-MX", "AR": "es-AR", "CL": "es-CL", "CO": "es-CO",
+    "TR": "tr-TR", "KZ": "ru-KZ", "JP": "ja-JP", "KR": "ko-KR",
+    "TN": "ar-TN", "MA": "ar-MA", "DZ": "ar-DZ", "EG": "ar-EG",
+    "ID": "id-ID", "VN": "vi-VN", "TH": "th-TH", "PH": "fil-PH",
+    "IN": "hi-IN", "SG": "en-SG", "MY": "ms-MY",
+}
+
+# --- username ---
+USERNAME_SUFFIX_LEN = 6
+USERNAME_PREFIX_MIN = 7
+USERNAME_PREFIX_MAX = 10
+USERNAME_MAX_TRIES = 8
+USERNAME_VALIDATION_WAIT_MAX = 3000
+USERNAME_VALIDATION_POLL_MS = 100
+
+# --- браузер ---
+HEADLESS = False
+HUMANIZE = False
+GEOIP = True
+BLOCK_WEBRTC = True
+
+FIREFOX_USER_PREFS = {
+    "security.webauth.webauthn": False,
+    "security.webauth.webauthn_enable_softtoken": False,
+    "security.webauth.webauthn_enable_usbtoken": False,
+    "security.webauth.u2f": False,
+
+    "media.peerconnection.enabled": False,
+    "media.peerconnection.turn.disable": True,
+    "media.peerconnection.use_document_iceservers": False,
+    "media.navigator.video.enabled": False,
+    "media.navigator.audio.enabled": False,
+    "media.getusermedia.enabled": False,
+
+    "toolkit.telemetry.enabled": False,
+    "toolkit.telemetry.unified": False,
+    "toolkit.telemetry.archive.enabled": False,
+    "toolkit.telemetry.bhrPing.enabled": False,
+    "toolkit.telemetry.newProfilePing.enabled": False,
+    "toolkit.telemetry.updateping.enabled": False,
+    "datareporting.healthreport.uploadEnabled": False,
+    "datareporting.policy.dataSubmissionEnabled": False,
+    "browser.ping-centre.telemetry": False,
+    "browser.newtabpage.activity-stream.feeds.telemetry": False,
+    "browser.newtabpage.activity-stream.telemetry": False,
+
+    "app.update.auto": False,
+    "app.update.enabled": False,
+    "browser.shell.checkDefaultBrowser": False,
+    "browser.startup.homepage_override.mstone": "ignore",
+    "browser.tabs.crashReporting.sendReport": False,
+
+    "browser.safebrowsing.malware.enabled": False,
+    "browser.safebrowsing.phishing.enabled": False,
+    "browser.safebrowsing.downloads.enabled": False,
+    "browser.safebrowsing.provider.google.update.enabled": False,
+    "browser.safebrowsing.provider.mozilla.update.enabled": False,
+
+    "dom.webdriver.enabled": False,
+    "marionette.enabled": False,
+
+    "network.dns.disableIPv6": True,
+    "network.predictor.enabled": False,
+    "network.prefetch-next": False,
+    "network.http.speculative-parallel-limit": 0,
+
+    "geo.enabled": False,
+    "geo.wifi.uri": "",
+
+    "media.eme.enabled": True,
+    "media.gmp-provider.enabled": False,
+}
+
+DISMISS_PASSKEY_MODAL = True
+PASSKEY_DECLINE_TEXTS = (
+    "Not now", "Not right now", "No thanks",
+    "Skip", "Skip for now", "Maybe later", "Cancel",
+)
+MODAL_POLL_EVERY = 2
+
+# ═══ ПАУЗЫ (сек) ═══
+PAUSE_FORM_LOAD_MIN = 0.8
+PAUSE_FORM_LOAD_MAX = 2.0
+PAUSE_BETWEEN_FIELDS_MIN = 0.35
+PAUSE_BETWEEN_FIELDS_MAX = 1.2
+PAUSE_BEFORE_SUBMIT_MIN = 0.6
+PAUSE_BEFORE_SUBMIT_MAX = 1.8
+PAUSE_BEFORE_NEXT_MIN = 0.4
+PAUSE_BEFORE_NEXT_MAX = 1.2
+PAUSE_READ_ERROR_MIN = 0.6
+PAUSE_READ_ERROR_MAX = 1.6
+
+# ═══ МЫШЬ ═══
+MOUSE_STEP_MIN_MS = 8
+MOUSE_STEP_MAX_MS = 16
+MOUSE_JITTER = 1.4
+MOUSE_JITTER_MID_BOOST = 1.8
+MOUSE_OFFSET_FACTOR = 0.40
+MOUSE_OFFSET_VARIANCE = 0.18
+MOUSE_CURVE_MIN_DIV = 38
+MOUSE_CURVE_MAX_DIV = 22
+MOUSE_MIN_STEPS = 8
+MOUSE_SETTLE_MIN_MS = 80
+MOUSE_SETTLE_MAX_MS = 220
+MOUSE_OVERSHOOT_PROB = 0.12
+
+# ═══ КЛИК ═══
+CLICK_AIM_MIN = 0.32
+CLICK_AIM_MAX = 0.68
+CLICK_AIM_DELAY_MIN = 120
+CLICK_AIM_DELAY_MAX = 320
+CLICK_AIM_HESITATE_PROB = 0.06
+CLICK_AIM_HESITATE_MIN = 400
+CLICK_AIM_HESITATE_MAX = 1000
+CLICK_HOLD_MIN_MS = 55
+CLICK_HOLD_MAX_MS = 120
+CLICK_AFTER_MIN_MS = 80
+CLICK_AFTER_MAX_MS = 220
+CLICK_FALLBACK_TIMEOUT = 2000
+SCROLL_INTO_VIEW_TIMEOUT = 1200
+
+# ═══ ПЕЧАТЬ ═══
+TYPE_INITIAL_PAUSE_MIN = 250
+TYPE_INITIAL_PAUSE_MAX = 600
+TYPE_BASE_MIN = 55
+TYPE_BASE_MAX = 110
+TYPE_BASE_MULT_MIN = 0.55
+TYPE_BASE_MULT_MAX = 1.8
+TYPE_THINK_PROB = 0.05
+TYPE_THINK_MIN = 350
+TYPE_THINK_MAX = 900
+TYPE_AFTER_MIN = 150
+TYPE_AFTER_MAX = 350
+TYPE_TYPO_PROB = 0.06
+TYPE_TYPO_PAUSE_MIN = 300
+TYPE_TYPO_PAUSE_MAX = 650
+TYPE_CORRECT_PAUSE_MIN = 180
+TYPE_CORRECT_PAUSE_MAX = 380
+
+# ═══ SELECT ═══
+SELECT_OPEN_PAUSE_MIN = 300
+SELECT_OPEN_PAUSE_MAX = 700
+SELECT_OPTION_TIMEOUT = 2000
+SELECT_AFTER_PAUSE_MIN = 150
+SELECT_AFTER_PAUSE_MAX = 350
+SELECT_ARROW_PAUSE_MIN = 70
+SELECT_ARROW_PAUSE_MAX = 180
+SELECT_KEYBOARD = True
+
+# ═══ RADIX ═══
+RADIX_OPEN_TIMEOUT = 3000
+RADIX_CLICK_SETTLE_MIN = 150
+RADIX_CLICK_SETTLE_MAX = 350
+RADIX_RETRY_PAUSE = 250
+RADIX_TYPEAHEAD_DELAY = 55
+
+# ═══ MULTI-PART ═══
+NEXT_WAIT_PART_TIMEOUT_S = 20
+NEXT_CLICK_PAUSE_MIN = 400
+NEXT_CLICK_PAUSE_MAX = 1000
+
+# --- токен ---
+SAVE_ROBLOSECURITY = True
+TOKENS_FILE = "tokens.txt"
+SAVE_FULL_COOKIES = False
+COOKIES_DIR = "cookies"
+
+# --- сервисные ---
+PAGE_LOAD_TIMEOUT = 60000
+FORM_WAIT_TIMEOUT_S = 3
+SUBMIT_WAIT_TIMEOUT_MS = 2000
+CAPTCHA_WAIT_SECONDS = 300
+CAPTCHA_POLL_INTERVAL_MS = 1000
+SHOTS_DIR = "screenshots"
+DEBUG = "--debug" in sys.argv
+
+# ═══════════════════════════════════════════════════════════════════════
+
+MONTH_ABBR = {1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
+              7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
+MONTH_FULL = {1: "January", 2: "February", 3: "March", 4: "April", 5: "May",
+              6: "June", 7: "July", 8: "August", 9: "September", 10: "October",
+              11: "November", 12: "December"}
+
+USERNAME_ERROR_MARKERS = (
+    "not appropriate", "already in use", "not allowed", "taken",
+    "invalid", "can only contain", "too short", "too long",
+    "doesn't follow", "keep it clean", "won't work",
+)
+
+ROBLOX_REJECT_TEXTS = ("try again later", "please try again", "попробуйте позже")
+REJECT_SELECTOR = "text=/" + "|".join(re.escape(t) for t in ROBLOX_REJECT_TEXTS) + "/i"
+
+USERNAME_SELECTORS = (
+    "#signup-username",
+    "input[data-testid*='username']",
+    "input[name='username']",
+)
+PASSWORD_SELECTORS = (
+    "#signup-password",
+    "input[type='password']",
+)
+NEXT_SELECTORS = (
+    "button:has-text('Next')",
+    "button:has-text('Continue')",
+    "[data-testid*='next-button']",
+    "[data-testid*='continue']",
+    "button[type='submit']",
+)
+CLOSE_MODAL_SELECTORS = (
+    "[role='dialog'] button[aria-label='Close']",
+    "[role='dialog'] button[aria-label='close']",
+    "[role='dialog'] button[aria-label*='lose']",
+)
+
+IANA_TO_WINDOWS_TZ = {
+    "America/Sao_Paulo": "E. South America Standard Time",
+    "America/Bahia": "Bahia Standard Time",
+    "America/Fortaleza": "SA Eastern Standard Time",
+    "America/Recife": "SA Eastern Standard Time",
+    "America/Manaus": "Central Brazilian Standard Time",
+    "America/Argentina/Buenos_Aires": "Argentina Standard Time",
+    "America/Santiago": "Pacific SA Standard Time",
+    "America/Bogota": "SA Pacific Standard Time",
+    "America/Lima": "SA Pacific Standard Time",
+    "America/Mexico_City": "Central Standard Time (Mexico)",
+    "America/New_York": "Eastern Standard Time",
+    "America/Toronto": "Eastern Standard Time",
+    "America/Montreal": "Eastern Standard Time",
+    "America/Chicago": "Central Standard Time",
+    "America/Denver": "Mountain Standard Time",
+    "America/Phoenix": "US Mountain Standard Time",
+    "America/Los_Angeles": "Pacific Standard Time",
+    "Europe/London": "GMT Standard Time",
+    "Europe/Dublin": "GMT Standard Time",
+    "Europe/Lisbon": "GMT Standard Time",
+    "Europe/Berlin": "W. Europe Standard Time",
+    "Europe/Vienna": "W. Europe Standard Time",
+    "Europe/Zurich": "W. Europe Standard Time",
+    "Europe/Rome": "W. Europe Standard Time",
+    "Europe/Amsterdam": "W. Europe Standard Time",
+    "Europe/Brussels": "Romance Standard Time",
+    "Europe/Paris": "Romance Standard Time",
+    "Europe/Madrid": "Romance Standard Time",
+    "Europe/Stockholm": "W. Europe Standard Time",
+    "Europe/Oslo": "W. Europe Standard Time",
+    "Europe/Copenhagen": "Romance Standard Time",
+    "Europe/Warsaw": "Central European Standard Time",
+    "Europe/Prague": "Central Europe Standard Time",
+    "Europe/Budapest": "Central Europe Standard Time",
+    "Europe/Belgrade": "Central Europe Standard Time",
+    "Europe/Zagreb": "Central European Standard Time",
+    "Europe/Ljubljana": "Central Europe Standard Time",
+    "Europe/Sarajevo": "Central European Standard Time",
+    "Europe/Skopje": "Central European Standard Time",
+    "Europe/Bratislava": "Central Europe Standard Time",
+    "Europe/Athens": "GTB Standard Time",
+    "Europe/Bucharest": "GTB Standard Time",
+    "Europe/Sofia": "FLE Standard Time",
+    "Europe/Helsinki": "FLE Standard Time",
+    "Europe/Riga": "FLE Standard Time",
+    "Europe/Vilnius": "FLE Standard Time",
+    "Europe/Tallinn": "FLE Standard Time",
+    "Europe/Kyiv": "FLE Standard Time",
+    "Europe/Kiev": "FLE Standard Time",
+    "Europe/Moscow": "Russian Standard Time",
+    "Europe/Istanbul": "Turkey Standard Time",
+    "Africa/Tunis": "W. Central Africa Standard Time",
+    "Africa/Algiers": "W. Central Africa Standard Time",
+    "Africa/Lagos": "W. Central Africa Standard Time",
+    "Africa/Cairo": "Egypt Standard Time",
+    "Africa/Johannesburg": "South Africa Standard Time",
+    "Africa/Casablanca": "Morocco Standard Time",
+    "Asia/Almaty": "Central Asia Standard Time",
+    "Asia/Tbilisi": "Georgian Standard Time",
+    "Asia/Yerevan": "Caucasus Standard Time",
+    "Asia/Baku": "Azerbaijan Standard Time",
+    "Asia/Dubai": "Arabian Standard Time",
+    "Asia/Kolkata": "India Standard Time",
+    "Asia/Bangkok": "SE Asia Standard Time",
+    "Asia/Jakarta": "SE Asia Standard Time",
+    "Asia/Ho_Chi_Minh": "SE Asia Standard Time",
+    "Asia/Singapore": "Singapore Standard Time",
+    "Asia/Kuala_Lumpur": "Singapore Standard Time",
+    "Asia/Manila": "Singapore Standard Time",
+    "Asia/Shanghai": "China Standard Time",
+    "Asia/Hong_Kong": "China Standard Time",
+    "Asia/Taipei": "Taipei Standard Time",
+    "Asia/Tokyo": "Tokyo Standard Time",
+    "Asia/Seoul": "Korea Standard Time",
+    "Australia/Sydney": "AUS Eastern Standard Time",
+}
+
+UA_HEADER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+             "AppleWebKit/537.36 (KHTML, like Gecko) Firefox/130.0")
+
+
+class AccountCrash(Exception):
+    pass
+
+
+class RotationDetected(Exception):
+    """Ротация 'на каждый запрос' — sticky-IP нет, регистрация невозможна."""
+    pass
+
+
+def log(msg, level="INFO"):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {msg}")
+
+def dbg(msg):
+    if DEBUG:
+        print(f"  [debug] {msg}")
+
+def shot(page, name):
+    if not DEBUG:
+        return
+    Path(SHOTS_DIR).mkdir(exist_ok=True)
+    try:
+        f = Path(SHOTS_DIR) / f"{datetime.now().strftime('%H%M%S')}_{name}.png"
+        page.screenshot(path=str(f), full_page=True)
+    except Exception:
+        pass
+
+def dump_html(page, name):
+    try:
+        html = page.evaluate("() => document.body.outerHTML.slice(-120000)")
+        Path(f"debug_{name}.html").write_text(html, encoding="utf-8")
+        log(f"📄 Дамп → debug_{name}.html", "WARN")
+    except Exception:
+        pass
+
+def human_pause(page, min_s, max_s):
+    page.wait_for_timeout(int(random.uniform(min_s, max_s) * 1000))
+
+def _is_browser_crash(e):
+    if TargetClosedError is not None and isinstance(e, TargetClosedError):
+        return True
+    s = f"{type(e).__name__}: {e}"
+    return ("Target page, context or browser has been closed" in s
+            or "TargetClosedError" in s
+            or "browser has been closed" in s.lower()
+            or "browser has crashed" in s.lower()
+            or "Target crashed" in s)
+
+
+# ---------- версия camoufox ----------
+
+def check_camoufox_version():
+    try:
+        from importlib.metadata import version as _v
+        ver = _v("camoufox")
+    except Exception:
+        ver = "?"
+    log(f"Версия camoufox: {ver}")
+
+
+# ---------- системный timezone ----------
+
+def get_os_timezone():
+    if sys.platform == "win32":
+        try:
+            r = subprocess.run(["tzutil", "/g"], capture_output=True,
+                               text=True, timeout=10)
+            return r.stdout.strip() or None
+        except Exception:
+            return None
+    try:
+        return time.tzname[0]
+    except Exception:
+        return None
+
+def set_os_timezone(tz):
+    """IANA ('Europe/Berlin') ИЛИ Windows-ID — Windows-ID напрямую."""
+    if not tz:
+        return False
+    if sys.platform == "win32":
+        win_id = tz if "/" not in tz else IANA_TO_WINDOWS_TZ.get(tz)
+        if not win_id:
+            return False
+        try:
+            r = subprocess.run(["tzutil", "/s", win_id], capture_output=True,
+                               text=True, timeout=10)
+            if r.returncode != 0:
+                log(f"⚠️  tzutil отказал ({(r.stderr or '').strip()[:80]}) — "
+                    f"запусти терминал ОТ ИМЕНИ АДМИНИСТРАТОРА", "WARN")
+                return False
+            return True
+        except Exception:
+            return False
+    try:
+        import os as _os
+        _os.environ["TZ"] = tz
+        time.tzset()
+        return True
+    except Exception:
+        return False
+
+def restore_os_timezone(orig):
+    if sys.platform == "win32" and orig:
+        return set_os_timezone(orig)
+    return False
+
+def _tz_offset_min(tz_name):
+    if not tz_name or ZoneInfo is None:
+        return None
+    try:
+        return int(datetime.now(ZoneInfo(tz_name))
+                   .utcoffset().total_seconds() // 60)
+    except Exception:
+        return None
+
+def _intl_offset_min(page, tz_name):
+    """UTC-смещение произвольной IANA-зоны силами браузера (Intl)."""
+    if not tz_name:
+        return None
+    js = """
+(tz) => {
+    try {
+        const parts = new Intl.DateTimeFormat('en-US',
+            {timeZone: tz, timeZoneName: 'longOffset'}).formatToParts(new Date());
+        const p = parts.find(x => x.type === 'timeZoneName');
+        if (!p) return null;
+        const m = p.value.match(/GMT([+-])(\\d{1,2})(?::(\\d{2}))?/);
+        if (!m) return null;
+        const sign = (m[1] === '-') ? -1 : 1;
+        return sign * (parseInt(m[2], 10) * 60 + parseInt(m[3] || '0', 10));
+    } catch (e) { return null; }
+}
+"""
+    try:
+        val = page.evaluate(js, tz_name)
+        return int(val) if val is not None else None
+    except Exception:
+        return None
+
+
+# ---------- Screen (совместимость версий API) ----------
+
+def make_screen(sw, sh):
+    if Screen is None:
+        return None
+    candidates = (
+        {"max_x": sw, "max_y": sh, "min_x": sw, "min_y": sh},
+        {"max_x": sw, "max_y": sh},
+        {"min_w": sw, "max_w": sw, "min_h": sh, "max_h": sh},
+        {"min_width": sw, "max_width": sw,
+         "min_height": sh, "max_height": sh},
+        {"width": sw, "height": sh},
+    )
+    for kw in candidates:
+        try:
+            return Screen(**kw)
+        except Exception:
+            continue
+    return None
+
+
+# ---------- прокси ----------
+
+def build_proxy(session):
+    if PROXY_MODE == "static":
+        user, pwd = STATIC_USER, STATIC_PASS
+        if STATIC_USER_TEMPLATE and "{session}" in STATIC_USER_TEMPLATE:
+            user = STATIC_USER_TEMPLATE.format(session=session)
+        if STATIC_PASS_TEMPLATE and "{session}" in STATIC_PASS_TEMPLATE:
+            pwd = STATIC_PASS_TEMPLATE.format(session=session)
+        return {"server": STATIC_SERVER, "username": user, "password": pwd}
+    password = PROXY_PASS_TEMPLATE.format(session=session,
+                                          lifetime=PROXY_LIFETIME_MIN)
+    return {"server": f"http://{PROXY_HOST}:{PROXY_PORT}",
+            "username": PROXY_USER, "password": password}
+
+def new_session_id():
+    return "".join(secrets.choice(string.ascii_lowercase + string.digits)
+                   for _ in range(PROXY_SESSION_LEN))
+
+def _proxy_get(url, proxy, timeout=PROXY_PREFLIGHT_TIMEOUT):
+    """GET через HTTP-прокси, preemptive auth + UA браузера."""
+    server = proxy["server"]
+    if server.startswith("socks"):
+        raise RuntimeError("preflight не ходит через SOCKS-схему")
+    creds = base64.b64encode(
+        f"{proxy.get('username', '')}:{proxy.get('password', '')}"
+        .encode()).decode()
+
+    class _ProxyAuth(urllib.request.BaseHandler):
+        def http_request(self, req):
+            req.add_unredirected_header("Proxy-Authorization",
+                                        f"Basic {creds}")
+            return req
+        https_request = http_request
+
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA_HEADER,
+        "Accept": "application/json, */*",
+    })
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": server, "https": server}),
+        _ProxyAuth())
+    return opener.open(req, timeout=timeout).read().decode("utf-8", "replace")
+
+def _geo_lookup(ip, proxy):
+    providers = (
+        GEO_JSON_URL,
+        "https://ipwho.is/" + (ip or ""),
+        "https://api.ip.sb/geoip/" + (ip or ""),
+    )
+    for url in providers:
+        try:
+            g = json.loads(_proxy_get(url, proxy))
+        except Exception as e:
+            dbg(f"geo-провайдер {url} упал: {e.__class__.__name__}")
+            continue
+        if not isinstance(g, dict):
+            continue
+        cc = (g.get("country_code") or g.get("countryCode") or "").upper()
+        tz = g.get("timezone")
+        if isinstance(tz, dict):
+            tz = tz.get("id")
+        if not cc and not tz:
+            continue
+        return {"ip": g.get("ip") or ip,
+                "country": g.get("country") or g.get("country_name"),
+                "countryCode": cc,
+                "city": g.get("city"),
+                "timezone": tz}
+    return None
+
+def detect_per_request_rotation(proxy):
+    """ДВА запроса ipify с паузой. IP разный → ротация per-request."""
+    if not ROTATION_PROBE:
+        return
+    try:
+        ip1 = _proxy_get("https://api.ipify.org", proxy).strip()
+    except Exception:
+        return
+    time.sleep(ROTATION_PROBE_PAUSE_S)
+    try:
+        ip2 = _proxy_get("https://api.ipify.org", proxy).strip()
+    except Exception:
+        return
+    if ip1 and ip2 and ip1 != ip2:
+        raise RotationDetected(
+            f"за {ROTATION_PROBE_PAUSE_S}с IP сменился {ip1} → {ip2}")
+
+def preflight_proxy(proxy):
+    """→ (exit_ip, geo) через сам прокси. Бросает RotationDetected."""
+    if not PROXY_PREFLIGHT:
+        return None, None
+    try:
+        ip = _proxy_get("https://api.ipify.org", proxy).strip()[:64]
+    except Exception as e:
+        log(f"⚠️  Preflight: прокси не отвечает ({e.__class__.__name__}: {e})",
+            "WARN")
+        log("   Проверь: креды (создай список прокси в ЛК!), "
+            "PROXY_SCHEME, порт открыт?", "WARN")
+        return None, None
+    detect_per_request_rotation(proxy)
+    geo = _geo_lookup(ip, proxy)
+    if geo is None:
+        log("⚠️  Preflight: все geo-провайдеры недоступны через прокси",
+            "WARN")
+    return ip, geo
+
+def preflight_with_filter(prev_ip=None):
+    """→ (proxy, session, exit_ip, geo)."""
+    def _passes_country(geo):
+        if not geo or not geo.get("countryCode"):
+            return True
+        cc = geo["countryCode"]
+        if ALLOWED_COUNTRIES and cc not in ALLOWED_COUNTRIES:
+            return False
+        if cc in BLOCKED_COUNTRIES:
+            return False
+        return True
+
+    if PROXY_MODE == "static":
+        has_sessions = bool(
+            (STATIC_USER_TEMPLATE and "{session}" in STATIC_USER_TEMPLATE)
+            or (STATIC_PASS_TEMPLATE and "{session}" in STATIC_PASS_TEMPLATE))
+        proxy, session, exit_ip, geo = None, "static", None, None
+        for i in range(1, IP_ROLL_MAX_TRIES + 1):
+            session = new_session_id() if has_sessions else "static"
+            proxy = build_proxy(session)
+            exit_ip, geo = preflight_proxy(proxy)
+            if not exit_ip:
+                return proxy, session, exit_ip, geo
+            if not _passes_country(geo):
+                log(f"↻ IP {exit_ip} ({geo.get('countryCode')}) не прошёл "
+                    f"фильтр стран — перекат ({i}/{IP_ROLL_MAX_TRIES})")
+                time.sleep(IP_ROLL_PAUSE_S)
+                continue
+            if NEW_IP_PER_ACCOUNT and prev_ip and exit_ip == prev_ip:
+                if has_sessions:
+                    log(f"↻ Сессия дала тот же IP ({exit_ip}) — "
+                        f"перегенерирую ({i}/{IP_ROLL_MAX_TRIES})")
+                else:
+                    log(f"↻ IP не сменился ({exit_ip}) — жду ротацию пула "
+                        f"({i}/{IP_ROLL_MAX_TRIES})")
+                time.sleep(IP_ROLL_PAUSE_S)
+                continue
+            return proxy, session, exit_ip, geo
+        if prev_ip and exit_ip == prev_ip:
+            log(f"⚠️  IP удержался ({exit_ip}) за {IP_ROLL_MAX_TRIES} "
+                f"попыток", "WARN")
+        return proxy, session, exit_ip, geo
+
+    proxy, session, exit_ip, geo = None, "-", None, None
+    for i in range(1, PREFLIGHT_MAX_TRIES + 1):
+        session = new_session_id()
+        proxy = build_proxy(session)
+        exit_ip, geo = preflight_proxy(proxy)
+        if not geo or not geo.get("countryCode"):
+            return proxy, session, exit_ip, geo
+        cc = geo["countryCode"]
+        if ALLOWED_COUNTRIES and cc not in ALLOWED_COUNTRIES:
+            log(f"↻ IP {exit_ip} ({cc}) не в ALLOWED — перегенерирую "
+                f"({i}/{PREFLIGHT_MAX_TRIES})")
+            continue
+        if cc in BLOCKED_COUNTRIES:
+            log(f"↻ IP {exit_ip} ({cc}) в BLOCKED — перегенерирую "
+                f"({i}/{PREFLIGHT_MAX_TRIES})")
+            continue
+        if NEW_IP_PER_ACCOUNT and prev_ip and exit_ip == prev_ip:
+            log(f"↻ IP совпал с предыдущим аккаунтом — новая сессия "
+                f"({i}/{PREFLIGHT_MAX_TRIES})")
+            continue
+        return proxy, session, exit_ip, geo
+    log("⚠️  Фильтр/ротация: не подобрал IP за лимит — работаю с тем, "
+        "что есть", "WARN")
+    return proxy, session, exit_ip, geo
+
+def log_exit_ip(page, expected_ip=None):
+    """Проверка утечек. TZ-матч трёхуровневый:
+      1) UTC-смещения равны; 2) один Windows-ID; 3) имена равны.
+    → (tz_ok, browser_tz, proxy_tz)."""
+    if not VERIFY_PROXY_IP:
+        return (True, None, None)
+
+    try:
+        page.goto(CHECK_IP_URL, wait_until="domcontentloaded", timeout=15000)
+        exit_ip = page.locator("body").inner_text().strip()[:64]
+        log(f"🌐 Выходной IP: {exit_ip}")
+        if expected_ip and exit_ip != expected_ip:
+            log(f"⚠️  IP сменился между preflight ({expected_ip}) и браузером "
+                f"({exit_ip}) — пул ротирует IP!", "WARN")
+    except Exception as e:
+        log(f"⚠️  Не проверил IP ({e.__class__.__name__})", "WARN")
+        return (True, None, None)
+
+    try:
+        webrtc_ok = page.evaluate(
+            "() => (typeof RTCPeerConnection === 'undefined' && "
+            "       typeof webkitRTCPeerConnection === 'undefined')")
+        if webrtc_ok:
+            log("🔒 WebRTC: заблокирован (утечек нет)")
+        else:
+            log("⚠️  WebRTC: доступен в JS!", "WARN")
+    except Exception:
+        pass
+
+    tz_ok, browser_tz, proxy_tz = True, None, None
+    try:
+        browser_tz = page.evaluate(
+            "() => Intl.DateTimeFormat().resolvedOptions().timeZone")
+        browser_off = -int(page.evaluate(
+            "() => new Date().getTimezoneOffset()"))
+        page.goto(GEO_JSON_URL, wait_until="domcontentloaded", timeout=15000)
+        geo = json.loads(page.locator("body").inner_text())
+        proxy_tz = geo.get("timezone")
+        proxy_city = geo.get("city") or "—"
+        proxy_country = geo.get("country") or "—"
+
+        proxy_off = _tz_offset_min(proxy_tz)
+        if proxy_off is None:
+            proxy_off = _intl_offset_min(page, proxy_tz)
+
+        win_b = IANA_TO_WINDOWS_TZ.get(browser_tz)
+        win_p = IANA_TO_WINDOWS_TZ.get(proxy_tz)
+        same_win = win_b is not None and win_b == win_p
+
+        if proxy_off is not None and browser_off == proxy_off:
+            log(f"🔒 Timezone совпадает (UTC{browser_off // 60:+d}): "
+                f"{browser_tz} ≈ {proxy_tz} "
+                f"({proxy_city}, {proxy_country})")
+        elif same_win:
+            log(f"🔒 Timezone совпадает (одна зона Windows "
+                f"'{win_b}'): {browser_tz} ≈ {proxy_tz} "
+                f"({proxy_city}, {proxy_country})")
+        elif browser_tz == proxy_tz:
+            log(f"🔒 Timezone совпадает (по имени): {browser_tz} "
+                f"({proxy_city}, {proxy_country})")
+        else:
+            tz_ok = False
+            off_str = (f"(UTC{browser_off // 60:+d}) " if proxy_off is not None
+                       else "")
+            log(f"🚨 TIMEZONE УТЕЧКА! Браузер: {browser_tz} {off_str}"
+                f"vs прокси: {proxy_tz}", "ERROR")
+    except Exception:
+        pass
+
+    try:
+        browser_locale = page.evaluate(
+            "() => navigator.language || navigator.languages[0]")
+        log(f"🗣  Locale браузера: {browser_locale}")
+    except Exception:
+        pass
+
+    return (tz_ok, browser_tz, proxy_tz)
+
+
+# ---------- фингерпринт ----------
+
+def make_fingerprint():
+    sw, sh = random.choice(SCREEN_POOL)
+    scale = random.uniform(WINDOW_SCALE_MIN, WINDOW_SCALE_MAX)
+    ww = max(800, int(sw * scale) // 2 * 2)
+    wh = max(600, int(sh * scale) // 2 * 2)
+    ww = min(ww, sw)
+    wh = min(wh, sh)
+    return {"screen": (sw, sh), "window": (ww, wh),
+            "cores": random.choice(CPU_CORES_POOL)}
+
+
+# ---------- генераторы ----------
+
+def random_username():
+    alphabet = string.ascii_letters + string.digits
+    prefix = "".join(secrets.choice(string.ascii_lowercase)
+                     for _ in range(random.randint(USERNAME_PREFIX_MIN,
+                                                   USERNAME_PREFIX_MAX)))
+    return prefix + "".join(secrets.choice(alphabet)
+                            for _ in range(USERNAME_SUFFIX_LEN))
+
+def random_password():
+    while True:
+        pwd = "".join(secrets.choice(
+            string.ascii_letters + string.digits + "!@#$"
+        ) for _ in range(16))
+        if (any(c.isupper() for c in pwd)
+                and any(c.islower() for c in pwd)
+                and any(c.isdigit() for c in pwd)):
+            return pwd
+
+def random_birth():
+    return {"month": secrets.randbelow(12) + 1,
+            "day":   secrets.randbelow(28) + 1,
+            "year":  secrets.randbelow(7) + 2000}
+
+def random_gender():
+    return secrets.choice(["Male", "Female"])
+
+def get_roblosecurity(page):
+    try:
+        cookies = page.context.cookies()
+    except Exception:
+        return None
+    for c in cookies:
+        if c.get("name") == ".ROBLOSECURITY":
+            return c.get("value")
+    return None
+
+def save_account(username, password, birth, gender, token=None):
+    birth_str = f"{MONTH_ABBR[birth['month']]}-{birth['day']:02d}-{birth['year']}"
+    line = f"{username}:{password}:{birth_str}:{gender.lower()}"
+    if token:
+        line += f":{token}"
+    with open("accounts.txt", "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    if token:
+        with open(TOKENS_FILE, "a", encoding="utf-8") as f:
+            f.write(token + "\n")
+    file = Path("accounts.json")
+    accounts = []
+    if file.exists():
+        try:
+            accounts = json.loads(file.read_text(encoding="utf-8"))
+        except Exception:
+            accounts = []
+    accounts.append({"username": username, "password": password,
+                     "birth": birth_str, "gender": gender.lower(),
+                     "roblosecurity": token,
+                     "created_at": datetime.now().isoformat()})
+    file.write_text(json.dumps(accounts, indent=2, ensure_ascii=False),
+                    encoding="utf-8")
+    if token:
+        log(f"💾 Сохранено: {username}:{password} | 🔑 токен → {TOKENS_FILE}")
+    else:
+        log(f"💾 Сохранено: {username}:{password} (без токена)")
+
+
+# ---------- поиск видимых / модалки ----------
+
+def find_visible(page, sels):
+    if isinstance(sels, str):
+        sels = (sels,)
+    for sel in sels:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                return sel
+        except Exception:
+            continue
+    return None
+
+def wait_for_any_visible(page, sels, timeout_s=20):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if DISMISS_PASSKEY_MODAL:
+            decline_passkey(page)
+        found = find_visible(page, sels)
+        if found:
+            return found
+        page.wait_for_timeout(150)
+    return None
+
+def advance_to_next_part(page):
+    human_pause(page, PAUSE_BEFORE_NEXT_MIN, PAUSE_BEFORE_NEXT_MAX)
+    for sel in NEXT_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if (loc.count() > 0 and loc.is_visible()
+                    and loc.is_enabled()):
+                human_click(page, sel)
+                page.wait_for_timeout(
+                    random.randint(NEXT_CLICK_PAUSE_MIN, NEXT_CLICK_PAUSE_MAX))
+                dbg(f"Next: '{sel}'")
+                return True
+        except Exception:
+            continue
+    return False
+
+def decline_passkey(page):
+    if not DISMISS_PASSKEY_MODAL:
+        return False
+    for txt in PASSKEY_DECLINE_TEXTS:
+        for scope in ("[role='dialog'] ", ""):
+            sel = f"{scope}button:has-text('{txt}')"
+            try:
+                loc = page.locator(sel).first
+                if loc.count() > 0 and loc.is_visible():
+                    human_click(page, sel)
+                    page.wait_for_timeout(200)
+                    log(f"🚫 Отклонил passkey/upsell-модалку ('{txt}')")
+                    return True
+            except Exception:
+                continue
+    for sel in CLOSE_MODAL_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                human_click(page, sel)
+                page.wait_for_timeout(150)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ВВОД НИКА
+# ─────────────────────────────────────────────────────────────────────────
+
+def _field_value(page, sel):
+    try:
+        return page.locator(sel).first.evaluate("el => el.value || ''")
+    except Exception:
+        return None
+
+def clear_field(page, sel, tries=3):
+    for _ in range(tries):
+        try:
+            human_click(page, sel)
+            page.wait_for_timeout(random.randint(80, 180))
+            page.keyboard.press("Control+A")
+            page.wait_for_timeout(random.randint(90, 200))
+            page.keyboard.press("Delete")
+            page.wait_for_timeout(random.randint(80, 160))
+            if _field_value(page, sel) == "":
+                return True
+            try:
+                page.locator(sel).first.click(
+                    click_count=3, timeout=CLICK_FALLBACK_TIMEOUT)
+                page.wait_for_timeout(random.randint(80, 160))
+                page.keyboard.press("Delete")
+                page.wait_for_timeout(random.randint(60, 120))
+            except Exception:
+                pass
+            if _field_value(page, sel) == "":
+                return True
+        except Exception:
+            continue
+    return False
+
+def read_username_validation(page):
+    for sel in ("#signup-usernameInputValidation",
+                "#signup-username-v2-input-validation",
+                "[data-testid='usernameInputValidation']"):
+        try:
+            loc = page.locator(sel).first
+            if loc.count() == 0 or not loc.is_visible():
+                continue
+            txt = loc.inner_text(timeout=300).strip()
+            if txt:
+                low = txt.lower()
+                is_err = ("is valid" not in low) or (
+                    any(m in low for m in USERNAME_ERROR_MARKERS))
+                return (is_err, txt)
+        except Exception:
+            continue
+    return (False, "")
+
+def wait_username_validation(page):
+    deadline = time.time() + USERNAME_VALIDATION_WAIT_MAX / 1000
+    while time.time() < deadline:
+        is_err, txt = read_username_validation(page)
+        if txt:
+            return is_err, txt
+        page.wait_for_timeout(USERNAME_VALIDATION_POLL_MS)
+    return (False, "")
+
+def fill_username(page, birth):
+    sel = find_visible(page, USERNAME_SELECTORS) or USERNAME_SELECTORS[0]
+    for attempt in range(1, USERNAME_MAX_TRIES + 1):
+        nick = random_username()
+        log(f"  Ник {attempt}/{USERNAME_MAX_TRIES}: {nick}")
+        if not clear_field(page, sel):
+            dbg("поле не очистилось — пробую всё равно")
+        human_type(page, sel, nick)
+        val = _field_value(page, sel)
+        if val is not None and val != nick:
+            log(f"  ⚠️  В поле {len(val)} симв. вместо {len(nick)} — "
+                f"склейка, очищаю и заново", "WARN")
+            clear_field(page, sel)
+            continue
+        is_err, txt = wait_username_validation(page)
+        if not is_err:
+            if txt:
+                dbg(f"валидация: '{txt}'")
+            return nick
+        log(f"  ⚠️  Форма отклонила: {txt}", "WARN")
+        human_pause(page, PAUSE_READ_ERROR_MIN, PAUSE_READ_ERROR_MAX)
+        clear_field(page, sel)
+    return None
+
+
+# ---------- мышь: биомеханика ----------
+
+MOUSE = {"x": None, "y": None}
+
+def _bezier(p0, p1, p2, t):
+    x = (1 - t) ** 2 * p0[0] + 2 * (1 - t) * t * p1[0] + t ** 2 * p2[0]
+    y = (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * p1[1] + t ** 2 * p2[1]
+    return x, y
+
+def _move_along(page, p0, p1, p2):
+    dist = math.hypot(p2[0]-p0[0], p2[1]-p0[1])
+    steps = random.randint(
+        max(MOUSE_MIN_STEPS, int(dist / MOUSE_CURVE_MIN_DIV)),
+        max(MOUSE_MIN_STEPS + 3, int(dist / MOUSE_CURVE_MAX_DIV)))
+    for i in range(1, steps + 1):
+        t = i / steps
+        te = t * t * (3 - 2 * t)
+        te += random.uniform(-0.03, 0.03) * (1 - abs(2*t - 1))
+        te = max(0.0, min(1.0, te))
+        bx, by = _bezier(p0, p1, p2, te)
+        jf = MOUSE_JITTER * (1 + (MOUSE_JITTER_MID_BOOST - 1)
+                             * math.sin(math.pi * t))
+        bx += random.uniform(-jf, jf)
+        by += random.uniform(-jf, jf)
+        try:
+            page.mouse.move(bx, by)
+        except Exception:
+            pass
+        step_ms = random.randint(MOUSE_STEP_MIN_MS, MOUSE_STEP_MAX_MS)
+        if t > 0.75:
+            step_ms += random.randint(4, 14)
+        page.wait_for_timeout(step_ms)
+
+def human_move(page, x, y):
+    if MOUSE["x"] is None:
+        MOUSE["x"] = x + random.randint(-350, 350)
+        MOUSE["y"] = y + random.randint(-250, 250)
+        try:
+            page.mouse.move(MOUSE["x"], MOUSE["y"])
+        except Exception:
+            pass
+    p0 = (MOUSE["x"], MOUSE["y"])
+    p2 = (x + random.uniform(-2, 2), y + random.uniform(-2, 2))
+    dx, dy = p2[0] - p0[0], p2[1] - p0[1]
+    dist = max(1.0, math.hypot(dx, dy))
+    off = random.uniform(
+        MOUSE_OFFSET_FACTOR - MOUSE_OFFSET_VARIANCE,
+        MOUSE_OFFSET_FACTOR + MOUSE_OFFSET_VARIANCE) * dist
+    if random.random() < 0.5:
+        off = -off
+    p1 = ((p0[0] + p2[0]) / 2 - dy / dist * off,
+          (p0[1] + p2[1]) / 2 + dx / dist * off)
+    _move_along(page, p0, p1, p2)
+    if random.random() < MOUSE_OVERSHOOT_PROB:
+        over = random.uniform(5, 16)
+        ang = math.atan2(dy, dx)
+        po = (p2[0] + math.cos(ang) * over + random.uniform(-3, 3),
+              p2[1] + math.sin(ang) * over + random.uniform(-3, 3))
+        _move_along(page, p2, p2, po)
+        page.wait_for_timeout(random.randint(60, 140))
+        _move_along(page, po, po, p2)
+    MOUSE["x"], MOUSE["y"] = p2
+    page.wait_for_timeout(
+        random.randint(MOUSE_SETTLE_MIN_MS, MOUSE_SETTLE_MAX_MS))
+
+def human_click(page, sel, aim="center"):
+    loc = page.locator(sel).first
+    try:
+        loc.scroll_into_view_if_needed(timeout=SCROLL_INTO_VIEW_TIMEOUT)
+    except Exception:
+        pass
+    box = None
+    try:
+        box = loc.bounding_box()
+    except Exception:
+        pass
+    if not box:
+        try:
+            loc.click(timeout=CLICK_FALLBACK_TIMEOUT)
+        except Exception:
+            pass
+        return
+    if aim == "center":
+        x = box["x"] + box["width"] * random.uniform(CLICK_AIM_MIN, CLICK_AIM_MAX)
+        y = box["y"] + box["height"] * random.uniform(CLICK_AIM_MIN, CLICK_AIM_MAX)
+    else:
+        x = box["x"] + box["width"] / 2
+        y = box["y"] + box["height"] / 2
+    human_move(page, x, y)
+    if random.random() < CLICK_AIM_HESITATE_PROB:
+        page.wait_for_timeout(
+            random.randint(CLICK_AIM_HESITATE_MIN, CLICK_AIM_HESITATE_MAX))
+    else:
+        page.wait_for_timeout(
+            random.randint(CLICK_AIM_DELAY_MIN, CLICK_AIM_DELAY_MAX))
+    try:
+        page.mouse.down()
+        page.wait_for_timeout(
+            random.randint(CLICK_HOLD_MIN_MS, CLICK_HOLD_MAX_MS))
+        page.mouse.up()
+    except Exception:
+        try:
+            loc.click(timeout=CLICK_FALLBACK_TIMEOUT)
+        except Exception:
+            pass
+        return
+    MOUSE["x"], MOUSE["y"] = x, y
+    page.wait_for_timeout(
+        random.randint(CLICK_AFTER_MIN_MS, CLICK_AFTER_MAX_MS))
+
+def idle_mouse(page):
+    if MOUSE["x"] is None:
+        MOUSE["x"] = random.randint(200, 800)
+        MOUSE["y"] = random.randint(150, 500)
+
+def human_type(page, sel, text):
+    human_click(page, sel)
+    page.wait_for_timeout(
+        random.randint(TYPE_INITIAL_PAUSE_MIN, TYPE_INITIAL_PAUSE_MAX))
+    typo_idx = None
+    if TYPE_TYPO_PROB > 0 and len(text) > 3 and random.random() < TYPE_TYPO_PROB:
+        typo_idx = random.randrange(1, len(text) - 1)
+    for i, ch in enumerate(text):
+        if i == typo_idx:
+            wrong = random.choice(string.ascii_lowercase)
+            if wrong == ch.lower():
+                wrong = "x" if wrong != "x" else "z"
+            try:
+                page.keyboard.type(wrong, delay=0)
+            except Exception:
+                pass
+            page.wait_for_timeout(
+                random.randint(TYPE_TYPO_PAUSE_MIN, TYPE_TYPO_PAUSE_MAX))
+            try:
+                page.keyboard.press("Backspace")
+            except Exception:
+                pass
+            page.wait_for_timeout(
+                random.randint(TYPE_CORRECT_PAUSE_MIN, TYPE_CORRECT_PAUSE_MAX))
+        try:
+            page.keyboard.type(ch, delay=0)
+        except Exception:
+            pass
+        if random.random() < TYPE_THINK_PROB:
+            page.wait_for_timeout(
+                random.randint(TYPE_THINK_MIN, TYPE_THINK_MAX))
+        else:
+            base = random.uniform(TYPE_BASE_MIN, TYPE_BASE_MAX)
+            base *= random.uniform(TYPE_BASE_MULT_MIN, TYPE_BASE_MULT_MAX)
+            if ch.isupper() or ch.isdigit() or not ch.isalnum():
+                base += random.randint(20, 60)
+            page.wait_for_timeout(int(base))
+    page.wait_for_timeout(random.randint(TYPE_AFTER_MIN, TYPE_AFTER_MAX))
+
+
+# ---------- дропдауны ----------
+
+def _native_keyboard_pick(page, sel, target_text):
+    try:
+        loc = page.locator(sel).first
+        value = loc.evaluate(
+            "el => el.selectedOptions[0]?.textContent?.trim() || ''")
+        options = loc.evaluate(
+            "el => Array.from(el.options).map(o => o.textContent.trim())")
+        if target_text not in options:
+            return False
+        cur_idx = options.index(value) if value in options else 0
+        target_idx = options.index(target_text)
+        diff = target_idx - cur_idx
+        if diff == 0:
+            return True
+        key = "ArrowDown" if diff > 0 else "ArrowUp"
+        for _ in range(abs(diff)):
+            page.keyboard.press(key)
+            page.wait_for_timeout(
+                random.randint(SELECT_ARROW_PAUSE_MIN, SELECT_ARROW_PAUSE_MAX))
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(
+            random.randint(SELECT_AFTER_PAUSE_MIN, SELECT_AFTER_PAUSE_MAX))
+        dbg(f"keyboard-pick: '{target_text}' ({abs(diff)} шагов)")
+        return True
+    except Exception:
+        return False
+
+def select_native_human(page, sel, select_values, option_texts, label):
+    loc = page.locator(sel).first
+    human_click(page, sel)
+    page.wait_for_timeout(
+        random.randint(SELECT_OPEN_PAUSE_MIN, SELECT_OPEN_PAUSE_MAX))
+    if SELECT_KEYBOARD:
+        for t in option_texts:
+            if _native_keyboard_pick(page, sel, t):
+                dbg(f"{label}: '{t}' (keyboard)")
+                return True
+    for v in select_values:
+        try:
+            loc.select_option(v, timeout=SELECT_OPTION_TIMEOUT)
+            page.wait_for_timeout(
+                random.randint(SELECT_AFTER_PAUSE_MIN, SELECT_AFTER_PAUSE_MAX))
+            dbg(f"{label}: '{v}' (select_option)")
+            return True
+        except Exception:
+            continue
+    try:
+        loc.evaluate("el => el.focus()")
+        page.wait_for_timeout(80)
+        for t in option_texts:
+            try:
+                loc.select_option(label=t, timeout=1500)
+                dbg(f"{label}: '{t}' (JS-focus fallback)")
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+def select_option_hidden(page, sel, select_values, option_texts, label):
+    loc = page.locator(sel).first
+    for v in select_values:
+        try:
+            loc.select_option(v, timeout=SELECT_OPTION_TIMEOUT)
+            page.wait_for_timeout(
+                random.randint(SELECT_AFTER_PAUSE_MIN, SELECT_AFTER_PAUSE_MAX))
+            dbg(f"{label}: '{v}' (hidden select)")
+            return True
+        except Exception:
+            continue
+    for t in option_texts:
+        try:
+            loc.select_option(label=t, timeout=1500)
+            dbg(f"{label}: '{t}' (hidden select, label)")
+            return True
+        except Exception:
+            continue
+    return False
+
+def close_leftover_popover(page):
+    try:
+        stuck = page.evaluate(
+            "() => !!document.querySelector('[data-radix-popper-content-wrapper]')"
+            " || document.body.style.pointerEvents === 'none'")
+        if stuck:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(150)
+            page.evaluate(
+                "() => { if (document.body.style.pointerEvents === 'none')"
+                " document.body.style.pointerEvents = '';"
+                " document.body.removeAttribute('data-scroll-locked'); }")
+    except Exception:
+        pass
+
+def radix_open(page, container_sel):
+    close_leftover_popover(page)
+    sel = f"{container_sel} button[role='combobox']"
+    if page.locator(sel).count() == 0:
+        return False
+    human_click(page, sel)
+    try:
+        page.locator("[data-radix-popper-content-wrapper]").first.wait_for(
+            state="visible", timeout=RADIX_OPEN_TIMEOUT)
+        return True
+    except Exception:
+        return False
+
+def radix_click_option(page, texts, label):
+    for exact in (True, False):
+        for t in texts:
+            for role in ("[role='option']", "[data-radix-collection-item]",
+                         "[role='menuitemradio']", "[role='menuitem']"):
+                base = (f"{role}:text-is('{t}')" if exact
+                        else f"{role}:has-text('{t}')")
+                try:
+                    if page.locator(base).count() > 0:
+                        human_click(page, base)
+                        page.wait_for_timeout(random.randint(
+                            RADIX_CLICK_SETTLE_MIN, RADIX_CLICK_SETTLE_MAX))
+                        dbg(f"{label}: клик по опции '{t}'")
+                        return True
+                except Exception:
+                    continue
+    for t in texts:
+        try:
+            page.keyboard.type(t, delay=RADIX_TYPEAHEAD_DELAY)
+            page.wait_for_timeout(random.randint(
+                RADIX_CLICK_SETTLE_MIN, RADIX_CLICK_SETTLE_MAX))
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(RADIX_RETRY_PAUSE)
+            dbg(f"{label}: typeahead '{t}'")
+            return True
+        except Exception:
+            continue
+    return False
+
+def radix_verify(page, container_sel, texts):
+    try:
+        loc = page.locator(
+            f"{container_sel} button[role='combobox']").first
+        if loc.count() == 0:
+            return False
+        txt = loc.inner_text(timeout=300).strip()
+        return any(t.lower() in txt.lower() for t in texts)
+    except Exception:
+        return False
+
+def pick_radix(page, container_sel, texts, label):
+    for _attempt in (1, 2):
+        if not radix_open(page, container_sel):
+            close_leftover_popover(page)
+            continue
+        if not radix_click_option(page, texts, label):
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(RADIX_RETRY_PAUSE)
+            continue
+        page.wait_for_timeout(random.randint(
+            RADIX_CLICK_SETTLE_MIN, RADIX_CLICK_SETTLE_MAX))
+        if radix_verify(page, container_sel, texts):
+            return True
+    close_leftover_popover(page)
+    return False
+
+def set_dropdown(page, sel, select_values, option_texts, label):
+    loc = page.locator(sel).first
+    try:
+        tag = loc.evaluate("el => el.tagName.toLowerCase()")
+    except Exception:
+        log(f"⚠️  {label}: {sel} не найден", "WARN")
+        return False
+    if tag == "select":
+        if select_native_human(page, sel, select_values, option_texts, label):
+            return True
+    else:
+        if pick_radix(page, sel, option_texts, label):
+            return True
+    inner = f"{sel} select"
+    try:
+        if page.locator(inner).count() > 0:
+            if select_option_hidden(page, inner, select_values,
+                                    option_texts, label):
+                return True
+    except Exception:
+        pass
+    log(f"⚠️  {label}: не выбралось", "WARN")
+    return False
+
+
+# ---------- общие ----------
+
+def dismiss_cookie_banner(page):
+    for txt in ("Accept All", "I agree", "Accept", "OK"):
+        try:
+            if page.locator(f"button:has-text('{txt}')").count() > 0:
+                human_click(page, f"button:has-text('{txt}')")
+                return
+        except Exception:
+            pass
+
+def wait_for_form(page, timeout_s=None):
+    timeout_s = timeout_s or FORM_WAIT_TIMEOUT_S
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        dismiss_cookie_banner(page)
+        if find_visible(page, ("#signup-username", "#MonthDropdown")):
+            try:
+                page.wait_for_selector(
+                    "#signup-username, #MonthDropdown",
+                    state="visible", timeout=5000)
+                return True
+            except Exception:
+                pass
+        page.wait_for_timeout(200)
+    return False
+
+def select_gender(page, gender):
+    icon = "head-female" if gender == "Female" else "head-male"
+    sels = [
+        f"button:has(span[class*='{icon}'])",
+        f"button[aria-pressed='false']:has-text('{gender}')",
+        f"#{gender}Button",
+    ]
+    for sel in sels:
+        try:
+            if page.locator(sel).count() == 0:
+                continue
+            human_click(page, sel)
+            return True
+        except Exception:
+            continue
+    return False
+
+def read_validations(page):
+    out = {}
+    for key, sel in [
+        ("birthday", "#signup-v2-birthday-error"),
+        ("birthday", "#signup-BirthdayInputValidation"),
+        ("username", "#signup-usernameInputValidation"),
+        ("password", "#signup-passwordInputValidation"),
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() == 0 or not loc.is_visible():
+                continue
+            txt = loc.inner_text(timeout=300).strip()
+            if txt:
+                out[key] = txt
+        except Exception:
+            continue
+    return out
+
+def wait_submit_enabled(page, timeout=None):
+    timeout = timeout or SUBMIT_WAIT_TIMEOUT_MS
+    try:
+        page.wait_for_function(
+            """() => {
+                const b = document.querySelector('#signup-button')
+                       || document.querySelector("button[aria-label='Create account']")
+                       || document.querySelector("button[type='submit']");
+                return b && !b.disabled;
+            }""",
+            timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+def click_submit(page):
+    sels = [
+        "#signup-button",
+        "button[aria-label='Create account']",
+        "button[type='submit']:not([disabled])",
+        "button:has-text('Sign Up')",
+        "button:has-text('Create account')",
+    ]
+    for sel in sels:
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible() and loc.is_enabled():
+                human_click(page, sel)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ТЕЛО СЕССИИ / ЗАПУСК / РЕТРАИ
+# ─────────────────────────────────────────────────────────────────────────
+
+TZ_STATE = {"aborts": 0, "warned": False}
+PREV_EXIT = {"ip": None}
+
+def _session_body(browser, password, birth, gender, t0, exit_ip=None):
+    m, d, y = birth["month"], birth["day"], birth["year"]
+    page = browser.new_page()
+    MOUSE["x"] = None
+    MOUSE["y"] = None
+
+    if PROXY_ENABLED:
+        tz_ok, _bt, _pt = log_exit_ip(page, expected_ip=exit_ip)
+        if ENFORCE_TZ_MATCH and not tz_ok:
+            TZ_STATE["aborts"] += 1
+            if TZ_STATE["aborts"] <= TZ_ABORT_LIMIT:
+                log("🛑 Прерываю сессию СРАЗУ — timezone не совпадает",
+                    "ERROR")
+                return False
+            if not TZ_STATE["warned"]:
+                TZ_STATE["warned"] = True
+                log("⚠️  Продолжаю несмотря на утечку TZ — ИСПРАВЬ: "
+                    "запусти терминал от админа", "WARN")
+
+    if NAVIGATE_VIA_HOME:
+        try:
+            page.goto(HOME_URL, wait_until="domcontentloaded",
+                      timeout=PAGE_LOAD_TIMEOUT)
+            page.wait_for_timeout(random.randint(1500, 3500))
+        except Exception:
+            pass
+    log(f"→ {URL}")
+    page.goto(URL, wait_until="domcontentloaded",
+              timeout=PAGE_LOAD_TIMEOUT)
+
+    if not wait_for_form(page):
+        page.reload(wait_until="domcontentloaded")
+        if not wait_for_form(page):
+            log("❌ Форма не появилась", "ERROR")
+            dump_html(page, "no-form")
+            return False
+
+    is_radix = page.locator(
+        "#MonthDropdown button[role='combobox']").count() > 0
+    has_pw_now = find_visible(page, PASSWORD_SELECTORS) is not None
+    variant = ("v2 (Radix)" if is_radix else "v1 (SSR select)") \
+        if has_pw_now else "v3 (multi-part)"
+    log(f"  ✓ Форма готова ({variant}) | {time.time()-t0:.1f}с")
+    shot(page, "00-landing")
+
+    # ---- дата ----
+    if find_visible(page, "#MonthDropdown"):
+        ok_m = set_dropdown(page, "#MonthDropdown",
+                            [MONTH_ABBR[m]],
+                            [MONTH_FULL[m], MONTH_ABBR[m]], "month")
+        human_pause(page, PAUSE_BETWEEN_FIELDS_MIN, PAUSE_BETWEEN_FIELDS_MAX)
+        ok_d = set_dropdown(page, "#DayDropdown",
+                            [f"{d:02d}", str(d)], [str(d), f"{d:02d}"], "day")
+        human_pause(page, PAUSE_BETWEEN_FIELDS_MIN, PAUSE_BETWEEN_FIELDS_MAX)
+        ok_y = set_dropdown(page, "#YearDropdown",
+                            [str(y)], [str(y)], "year")
+        log(f"  {'✓' if ok_m and ok_d and ok_y else '⚠️ '} "
+            f"Дата: m={ok_m} d={ok_d} y={ok_y} | {time.time()-t0:.1f}с")
+        shot(page, "01-birthday")
+    else:
+        log("  → Даты нет, жму Next")
+        advance_to_next_part(page)
+
+    # ---- ник ----
+    if not find_visible(page, USERNAME_SELECTORS):
+        log("  → Ника нет, жму Next")
+        if not advance_to_next_part(page):
+            log("⚠️  Next не найден", "WARN")
+        shot(page, "01b-after-next")
+        if not wait_for_any_visible(
+                page, USERNAME_SELECTORS, NEXT_WAIT_PART_TIMEOUT_S):
+            log("❌ Поле ника не появилось", "ERROR")
+            dump_html(page, "no-username")
+            return False
+
+    username = fill_username(page, birth)
+    if username is None:
+        log(f"❌ Ник не подобран за {USERNAME_MAX_TRIES} попыток", "ERROR")
+        dump_html(page, "username-tries")
+        return False
+    log(f"  ✓ Ник: {username} | {time.time()-t0:.1f}с")
+
+    # ---- пол: часть 1 ----
+    human_pause(page, PAUSE_BETWEEN_FIELDS_MIN, PAUSE_BETWEEN_FIELDS_MAX)
+    gender_done = select_gender(page, gender)
+    if gender_done:
+        log(f"  ✓ Пол (часть 1): {gender} | {time.time()-t0:.1f}с")
+
+    # ---- пароль ----
+    pw_sel = find_visible(page, PASSWORD_SELECTORS)
+    if not pw_sel:
+        log("  → Пароля нет (multi-part), жму Next")
+        if not advance_to_next_part(page):
+            log("⚠️  Next не найден", "WARN")
+        shot(page, "01c-to-part2")
+        pw_sel = wait_for_any_visible(
+            page, PASSWORD_SELECTORS, NEXT_WAIT_PART_TIMEOUT_S)
+        if not pw_sel:
+            log("❌ Поле пароля не появилось", "ERROR")
+            dump_html(page, "no-password")
+            return False
+
+    human_pause(page, PAUSE_BETWEEN_FIELDS_MIN, PAUSE_BETWEEN_FIELDS_MAX)
+    try:
+        human_type(page, pw_sel, password)
+        log(f"  ✓ Password | {time.time()-t0:.1f}с")
+    except Exception:
+        log("⚠️  Password не заполнился", "WARN")
+        dump_html(page, "password")
+
+    if not gender_done:
+        if select_gender(page, gender):
+            log(f"  ✓ Пол (часть 2): {gender} | {time.time()-t0:.1f}с")
+        else:
+            log("  ✓ Пол пропущен", "WARN")
+
+    shot(page, "02-filled")
+
+    errs = read_validations(page)
+    if "username" in errs:
+        log(f"  ⚠️  Ошибка ника: {errs['username']}", "WARN")
+        clear_field(page, USERNAME_SELECTORS[0])
+        username = fill_username(page, birth)
+        if username is None:
+            return False
+
+    wait_submit_enabled(page)
+
+    human_pause(page, PAUSE_BEFORE_SUBMIT_MIN, PAUSE_BEFORE_SUBMIT_MAX)
+    if not click_submit(page):
+        try:
+            page.locator(pw_sel).press("Enter")
+        except Exception:
+            log("⚠️  Сабмит вручную", "WARN")
+
+    log("⏳ Жду капчу/результат...")
+
+    success = False
+    polls = CAPTCHA_WAIT_SECONDS * 1000 // CAPTCHA_POLL_INTERVAL_MS
+    for i in range(polls):
+        page.wait_for_timeout(CAPTCHA_POLL_INTERVAL_MS)
+        if i % MODAL_POLL_EVERY == 0 and DISMISS_PASSKEY_MODAL:
+            decline_passkey(page)
+        if "createaccount" not in page.url.lower():
+            success = True
+            break
+        try:
+            if page.locator(REJECT_SELECTOR).count() > 0:
+                log("🚫 Roblox отклонил регистрацию ('try again later')",
+                    "ERROR")
+                shot(page, "03-rejected")
+                if DEBUG:
+                    dump_html(page, "rejected")
+                return False
+        except Exception:
+            pass
+
+    if success:
+        log(f"✅ Аккаунт зарегистрирован! URL: {page.url}")
+        page.wait_for_timeout(random.randint(800, 1600))
+        decline_passkey(page)
+        shot(page, "03-success")
+
+        token = get_roblosecurity(page) if SAVE_ROBLOSECURITY else None
+        if token:
+            log(f"🔑 .ROBLOSECURITY: {token[:40]}... ({len(token)} симв.)")
+        else:
+            log("⚠️  Кука .ROBLOSECURITY не найдена", "WARN")
+
+        if SAVE_FULL_COOKIES:
+            try:
+                Path(COOKIES_DIR).mkdir(exist_ok=True)
+                (Path(COOKIES_DIR) / f"{username}_cookies.json").write_text(
+                    json.dumps(page.context.cookies(), indent=2),
+                    encoding="utf-8")
+            except Exception:
+                pass
+
+        save_account(username, password, birth, gender, token)
+        return True
+
+    log("❌ Не зарегистрировалось (таймаут ожидания).", "ERROR")
+    errs = read_validations(page)
+    if errs:
+        log(f"   Ошибки: {errs}")
+    shot(page, "03-timeout")
+    return False
+
+
+# Цепочка ослабления kwargs при ValueError browserforge.
+# geoip — последний рубеж: датасет browserforge не имеет заголовков для
+# части локалей (pl-PL/de-DE/...), которые geoip требует по стране IP.
+RELAX_ORDER = ("screen", "window", "geoip")
+
+def _run_session(base_kwargs, password, birth, gender, t0, exit_ip=None):
+    attempt_kwargs = dict(base_kwargs)
+    relax = list(RELAX_ORDER)
+    same_retries = 0
+    while True:
+        body_started = False
+        try:
+            with Camoufox(**attempt_kwargs) as browser:
+                body_started = True
+                return _session_body(browser, password, birth, gender, t0,
+                                     exit_ip=exit_ip)
+        except TypeError as e:
+            if body_started:
+                raise
+            mt = re.search(r"unexpected keyword argument '(\w+)'", str(e))
+            if not mt or mt.group(1) not in attempt_kwargs:
+                raise
+            bad = mt.group(1)
+            attempt_kwargs.pop(bad)
+            dbg(f"Camoufox не знает '{bad}' — убираю")
+            continue
+        except ValueError as e:
+            if body_started:
+                raise
+            if "No headers based on this input" not in str(e):
+                raise
+            same_retries += 1
+            if same_retries <= 2:
+                log(f"⚠️  browserforge: нет заголовков для локали страны IP "
+                    f"— ретрай {same_retries}/2 (версия браузера случайна)",
+                    "WARN")
+                continue
+            while relax and relax[0] not in attempt_kwargs:
+                relax.pop(0)
+            if not relax:
+                raise
+            bad = relax.pop(0)
+            attempt_kwargs.pop(bad, None)
+            if bad == "geoip":
+                log("⚠️  browserforge: отключаю geoip — датасет не имеет "
+                    "заголовков для локали этой страны", "WARN")
+                log("   Timezone останется синхронизированным (явный kwarg "
+                    "+ ОС), WebRTC убит. Locale станет нейтральной (en-US) "
+                    "— слабый сигнал.", "WARN")
+            else:
+                log(f"⚠️  browserforge: убираю '{bad}' "
+                    f"(конфликт с датасетом)", "WARN")
+            continue
+        except Exception as e:
+            if body_started and _is_browser_crash(e):
+                raise AccountCrash(f"{type(e).__name__}: {e}") from e
+            raise
+
+
+def create_account(index, total):
+    t0 = time.time()
+    password = random_password()
+    birth = random_birth()
+    gender = random_gender()
+    m, d, y = birth["month"], birth["day"], birth["year"]
+    TZ_STATE["aborts"] = 0
+    TZ_STATE["warned"] = False
+
+    for attempt in range(1, ACCOUNT_RETRIES + 1):
+        if attempt > 1:
+            pause = random.randint(RETRY_PAUSE_MIN_S, RETRY_PAUSE_MAX_S)
+            log(f"⏸  Пауза перед ретраем {pause}с...")
+            time.sleep(pause)
+
+        if PROXY_ENABLED:
+            try:
+                proxy, session, exit_ip, geo = preflight_with_filter(
+                    prev_ip=PREV_EXIT["ip"])
+            except RotationDetected as rd:
+                log("🚨 РОТАЦИЯ 'НА КАЖДЫЙ ЗАПРОС' ОБНАРУЖЕНА! "
+                    f"({rd})", "ERROR")
+                log("   → В ЛК поставь sticky-ротацию и перезапусти.",
+                    "ERROR")
+                return False
+            if exit_ip:
+                if PREV_EXIT["ip"] and exit_ip != PREV_EXIT["ip"]:
+                    log(f"🆕 Новый IP для аккаунта: {exit_ip} "
+                        f"(был {PREV_EXIT['ip']})")
+                PREV_EXIT["ip"] = exit_ip
+        else:
+            proxy, session, exit_ip, geo = None, "-", None, None
+
+        fp = make_fingerprint()
+        sw, sh = fp["screen"]
+        ww, wh = fp["window"]
+
+        log("=" * 55)
+        tag = f"попытка {attempt}/{ACCOUNT_RETRIES}" if attempt > 1 else "старт"
+        log(f"АККАУНТ {index}/{total} | сессия {session} | {tag}")
+        log(f"Пароль: {password} | Дата: {MONTH_FULL[m]} {d}, {y} | "
+            f"Пол: {gender}")
+        log(f"Железо: экран {sw}x{sh}, окно {ww}x{wh}, CPU {fp['cores']} ядер")
+        if geo:
+            city = geo.get("city") or "—"
+            log(f"🌍 Exit: {city}, {geo.get('country')} "
+                f"({geo.get('countryCode')}) | timezone: {geo.get('timezone')}")
+        elif exit_ip:
+            log(f"🌍 Exit-IP (preflight): {exit_ip} (гео недоступно)")
+        log("=" * 55)
+
+        # ═══ СИНХРОНИЗАЦИЯ СИСТЕМНОГО TIMEZONE ═══
+        orig_tz = None
+        expected_tz = None
+        if geo and geo.get("timezone"):
+            expected_tz = geo["timezone"]
+        if SYNC_OS_TIMEZONE and proxy and expected_tz:
+            orig_tz = get_os_timezone()
+            if set_os_timezone(expected_tz):
+                log(f"🖥  Системный timezone: {orig_tz} → {expected_tz}")
+            else:
+                orig_tz = None
+                log("⚠️  TZ ОС не сменился — браузер будет с твоим "
+                    "системным временем (утечка)", "ERROR")
+
+        base_kwargs = dict(
+            headless=HEADLESS, humanize=HUMANIZE, geoip=GEOIP,
+            block_webrtc=BLOCK_WEBRTC, os=OS_LIST,
+            window=(int(ww), int(wh)),
+            hardware_concurrency=fp["cores"],
+            firefox_user_prefs=FIREFOX_USER_PREFS,
+            disable_coop=True,
+            i_know_what_im_doing=True,
+        )
+        scr = make_screen(sw, sh)
+        if scr is not None:
+            base_kwargs["screen"] = scr
+
+        if expected_tz:
+            base_kwargs["timezone"] = expected_tz
+
+        if MANUAL_LOCALE:
+            base_kwargs["locale"] = [MANUAL_LOCALE]
+        elif PASS_LOCALE_EXPLICITLY and geo and geo.get("countryCode"):
+            loc = COUNTRY_LOCALE.get(geo["countryCode"])
+            if loc:
+                base_kwargs["locale"] = [loc]
+
+        if proxy:
+            base_kwargs["proxy"] = proxy
+
+        ok = False
+        try:
+            ok = _run_session(base_kwargs, password, birth, gender, t0,
+                              exit_ip=exit_ip)
+        except AccountCrash as e:
+            log(f"💥 Браузер крашнулся: {e}", "ERROR")
+        except KeyboardInterrupt:
+            if orig_tz:
+                if restore_os_timezone(orig_tz):
+                    log(f"🖥  Timezone ОС восстановлен: {orig_tz}")
+                else:
+                    log(f'🚨 НЕ ВЕРНУЛ TZ! Вручную: tzutil /s "{orig_tz}"',
+                        "ERROR")
+            raise
+        finally:
+            if orig_tz:
+                if restore_os_timezone(orig_tz):
+                    log(f"🖥  Timezone ОС восстановлен: {orig_tz}")
+                else:
+                    log(f'🚨 НЕ ВЕРНУЛ TZ! Вручную: tzutil /s "{orig_tz}"',
+                        "ERROR")
+
+        if ok:
+            return True
+
+        if attempt < ACCOUNT_RETRIES:
+            log(f"↻ Попытка {attempt} не прошла — ретрай "
+                f"({attempt + 1}/{ACCOUNT_RETRIES})")
+            continue
+        log(f"❌ Аккаунт {index}: не создан за {ACCOUNT_RETRIES} попыток",
+            "ERROR")
+        return False
+    return False
+
+
+def main():
+    proxy_desc = (f"mobile pool {STATIC_SERVER}"
+                  if PROXY_MODE == "static"
+                  else f"ротация {PROXY_HOST}:{PROXY_PORT}")
+    log(f"План: {ACCOUNTS_TO_CREATE} аккаунт(ов) | "
+        f"прокси: {'ВКЛ — ' + proxy_desc if PROXY_ENABLED else 'выкл'} | "
+        f"новый IP на аккаунт: {'ВКЛ' if NEW_IP_PER_ACCOUNT else 'выкл'} | "
+        f"sync ОС-timezone: {'ВКЛ' if SYNC_OS_TIMEZONE else 'выкл'} | "
+        f"geoip: {'ВКЛ' if GEOIP else 'выкл'} | "
+        f"WebRTC: {'убит' if BLOCK_WEBRTC else 'жив'}")
+    check_camoufox_version()
+    if SYNC_OS_TIMEZONE and sys.platform == "win32":
+        log(f"🖥  Текущий timezone Windows: {get_os_timezone()}")
+    created = 0
+    for i in range(1, ACCOUNTS_TO_CREATE + 1):
+        try:
+            if create_account(i, ACCOUNTS_TO_CREATE):
+                created += 1
+        except KeyboardInterrupt:
+            log("⏹  Остановлено пользователем", "WARN")
+            break
+        except Exception as e:
+            log(f"❌ Аккаунт {i} упал: {e.__class__.__name__}: {e}", "ERROR")
+        if i < ACCOUNTS_TO_CREATE:
+            pause = random.randint(ACCOUNT_PAUSE_MIN_S, ACCOUNT_PAUSE_MAX_S)
+            log(f"⏸  Пауза {pause}с...")
+            time.sleep(pause)
+    log("=" * 55)
+    log(f"Итог: создано {created}/{ACCOUNTS_TO_CREATE}")
+    log("=" * 55)
+    input("Enter для выхода...")
+
+
+if __name__ == "__main__":
+    main()
